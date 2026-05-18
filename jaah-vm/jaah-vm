@@ -18,7 +18,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.5.1"
+readonly JAAH_VM_VERSION="0.5.2"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -73,7 +73,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.5.1
+VERSION: jaah-vm v0.5.2
 EOF
 }
 
@@ -915,7 +915,20 @@ cmd_status() {
     is_managed "$vmid" || fail "VMID $vmid is not managed by jaah-vm"
 
     echo "─── jaah-vm status: $arg ───"
-    qm config "$vmid" | grep -E '^(name|tags|cores|memory|cpu|net0|description|ipconfig0):' | sed 's/^/  /'
+    # qm stores description URL-encoded (%3A, %0A, etc.); decode for display.
+    qm config "$vmid" \
+        | grep -E '^(name|tags|cores|memory|cpu|net0|description|ipconfig0):' \
+        | python3 -c "
+import sys, urllib.parse
+for line in sys.stdin:
+    if line.startswith('description:'):
+        key, _, val = line.partition(':')
+        print(f'  {key}:')
+        for sub in urllib.parse.unquote(val).strip().split(chr(10)):
+            print(f'    {sub}')
+    else:
+        print('  ' + line.rstrip())
+"
     local s
     s=$(qm status "$vmid" | awk '{print $2}')
     echo "  status: $s"
@@ -1118,14 +1131,22 @@ cmd_restart() {
     require_root
     local vmid; vmid=$(_resolve_managed_vmid "$arg")
     local s; s=$(qm status "$vmid" | awk '{print $2}')
-    if [ "$s" = "running" ]; then
-        log "Rebooting VMID=$vmid (graceful)"
-        qm reboot "$vmid" --timeout 60
-    else
+    if [ "$s" != "running" ]; then
         log "VMID=$vmid was stopped — starting"
         qm start "$vmid"
+        ok "Started"
+        return 0
     fi
-    ok "Restarted"
+    log "Rebooting VMID=$vmid (graceful ACPI/qga, 60s timeout)"
+    local rc=0
+    qm reboot "$vmid" --timeout 60 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        warn "Graceful reboot timed out (qga not ready yet?) — falling back to hard reset"
+        qm reset "$vmid" --skiplock || fail "Hard reset also failed (qm reset exit $?)"
+        ok "Hard-reset"
+    else
+        ok "Restarted"
+    fi
 }
 
 cmd_snapshot() {
