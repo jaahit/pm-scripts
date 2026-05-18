@@ -1,0 +1,1053 @@
+#!/bin/bash
+# jaah-vm — Mini AWS-EC2-style VM launcher for the jaah Proxmox cluster.
+#
+# Subcommands:
+#   create   — Launch a new Ubuntu 26.04 cloud-init VM
+#   rerun    — Replay the exact recipe of an existing managed VM
+#   list     — Show all VMs managed by jaah-vm
+#   status   — Show details for one managed VM
+#   shell    — SSH into a managed VM
+#   destroy  — Terminate a managed VM (HMAC-verified, typed confirm)
+#   doctor   — Cluster + tool health check
+#   types    — Show instance-type presets
+#
+# See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
+
+readonly JAAH_VM_VERSION="0.2.0"
+export JAAH_VM_VERSION
+
+# Resolve installed lib path; fall back to repo-local for development.
+_resolve_lib() {
+    local self_dir
+    self_dir=$(dirname "$(readlink -f "$0")")
+    for p in /usr/local/lib/jaah-vm/lib-common.sh "${self_dir}/lib-common.sh"; do
+        [ -r "$p" ] && { echo "$p"; return 0; }
+    done
+    echo ""
+}
+
+_LIB=$(_resolve_lib)
+if [ -z "$_LIB" ]; then
+    echo "FATAL: lib-common.sh not found" >&2
+    exit 1
+fi
+# shellcheck source=lib-common.sh
+. "$_LIB"
+
+# ────────────────────────────────────────────────────────────────────────────
+# Cheat sheet (no-args)
+# ────────────────────────────────────────────────────────────────────────────
+
+show_cheatsheet() {
+    cat <<'EOF'
+jaah-vm — Mini EC2 Launch Wizard for jaah-cluster
+
+QUICK START:
+    jaah-vm create --name web-01                    # default: type=small, dhcp, key-only
+    jaah-vm create --name db-01 --type large --start --wait-ssh
+    jaah-vm list                                    # see all managed VMs
+    jaah-vm shell web-01                            # SSH into a VM
+    jaah-vm status web-01                           # IP + cloud-init + agent state
+    jaah-vm rerun web-01                            # rebuild exactly from recorded recipe
+    jaah-vm destroy web-01                          # tag-verified, typed confirm
+
+DISCOVERY:
+    jaah-vm types                                   # list instance-type presets
+    jaah-vm doctor                                  # cluster + tool health check
+    jaah-vm create --help                           # all create options
+    jaah-vm create --advanced --help                # advanced flags
+
+VERSION: jaah-vm v0.2.0
+EOF
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `types` subcommand
+# ────────────────────────────────────────────────────────────────────────────
+
+cmd_types() {
+    cat <<'EOF'
+Instance type presets:
+
+    PRESET    CORES  RAM      DISK    TYPICAL USE
+    tiny      1      1 GB     10 GB   smoke tests, bots
+    small     2      2 GB     20 GB   default — web/agent
+    medium    2      4 GB     40 GB   light apps
+    large     4      8 GB     80 GB   app servers
+    xl        8      16 GB    160 GB  heavy compute
+    2xl       16     32 GB    320 GB  very heavy compute
+
+Override individual fields with --cores, --memory, --disk.
+NOTE: Presets cover CPU/RAM/disk only. Databases need additional tuning
+(I/O latency, no ballooning, possibly pinned CPU) — a future db-* family
+will address that.
+EOF
+}
+
+# Map preset → (cores, memory_mb, disk_gb)
+preset_cores() { case "$1" in tiny) echo 1;; small) echo 2;; medium) echo 2;; large) echo 4;; xl) echo 8;; 2xl) echo 16;; *) return 1;; esac; }
+preset_memory() { case "$1" in tiny) echo 1024;; small) echo 2048;; medium) echo 4096;; large) echo 8192;; xl) echo 16384;; 2xl) echo 32768;; *) return 1;; esac; }
+preset_disk() { case "$1" in tiny) echo 10;; small) echo 20;; medium) echo 40;; large) echo 80;; xl) echo 160;; 2xl) echo 320;; *) return 1;; esac; }
+
+# ────────────────────────────────────────────────────────────────────────────
+# `version`
+# ────────────────────────────────────────────────────────────────────────────
+
+cmd_version() {
+    local sha="unknown"
+    local self_dir
+    self_dir=$(dirname "$(readlink -f "$0")")
+    sha=$(cd "$self_dir" 2>/dev/null && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    echo "jaah-vm v${JAAH_VM_VERSION}  (git ${sha})"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Template build
+# ────────────────────────────────────────────────────────────────────────────
+
+template_exists() {
+    qm config "$TEMPLATE_VMID" &>/dev/null
+}
+
+template_is_valid() {
+    template_exists || return 1
+    qm config "$TEMPLATE_VMID" | grep -qE '^template:\s*1' || return 1
+    qm config "$TEMPLATE_VMID" | grep -qE "^name:\s*${TEMPLATE_NAME}\$" || return 1
+    qm config "$TEMPLATE_VMID" | grep -qE '^tags:.*template' || return 1
+}
+
+build_template() {
+    local force="${1:-no}"
+
+    if template_is_valid && [ "$force" != "force" ]; then
+        ok "Template VMID=${TEMPLATE_VMID} (${TEMPLATE_NAME}) already valid — skip build"
+        return 0
+    fi
+
+    if template_exists; then
+        warn "Template VMID=${TEMPLATE_VMID} exists but invalid (or force) — destroying"
+        qm destroy "$TEMPLATE_VMID" --purge 1 --destroy-unreferenced-disks 1 --skiplock &>/dev/null || true
+    fi
+
+    [ -f "$CLOUD_IMG" ] || fail "Cloud image missing: $CLOUD_IMG  (download Ubuntu 26.04 LTS first)"
+    storage_active "$TEMPLATE_STORAGE" || fail "Template storage '$TEMPLATE_STORAGE' not active"
+
+    log "Building golden template VMID=${TEMPLATE_VMID} (${TEMPLATE_NAME})"
+
+    qm create "$TEMPLATE_VMID" \
+        --name "$TEMPLATE_NAME" \
+        --memory 2048 \
+        --cores 2 \
+        --cpu x86-64-v2-AES \
+        --net0 "virtio,bridge=vmbr0" \
+        --machine q35 \
+        --bios ovmf \
+        --ostype l26 \
+        --scsihw virtio-scsi-single \
+        --serial0 socket \
+        --vga serial0 \
+        --agent enabled=1,fstrim_cloned_disks=1 \
+        --tablet 0 \
+        --localtime 0 \
+        --tags "jaah,template"
+
+    log "  + EFI disk"
+    qm set "$TEMPLATE_VMID" --efidisk0 "${TEMPLATE_STORAGE}:1,efitype=4m,pre-enrolled-keys=0" >/dev/null
+
+    log "  + import cloud image (qcow2)"
+    qm importdisk "$TEMPLATE_VMID" "$CLOUD_IMG" "$TEMPLATE_STORAGE" --format qcow2 >/dev/null
+
+    local imported
+    imported=$(qm config "$TEMPLATE_VMID" | awk -F': ' '/^unused0:/ {print $2}')
+    [ -n "$imported" ] || fail "Template import failed — no unused0 disk found"
+
+    log "  + attach as scsi0  ($imported)"
+    qm set "$TEMPLATE_VMID" \
+        --scsi0 "${imported},discard=on,ssd=1,iothread=1" \
+        --delete unused0 >/dev/null
+
+    log "  + cloud-init drive"
+    qm set "$TEMPLATE_VMID" --ide2 "${TEMPLATE_STORAGE}:cloudinit" >/dev/null
+
+    log "  + boot order"
+    qm set "$TEMPLATE_VMID" --boot "order=scsi0" >/dev/null
+
+    log "  + base resize to 20G"
+    qm resize "$TEMPLATE_VMID" scsi0 20G >/dev/null
+
+    log "  + convert to template"
+    qm template "$TEMPLATE_VMID" >/dev/null
+
+    ok "Template built: VMID=${TEMPLATE_VMID} (${TEMPLATE_NAME})"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `create` subcommand
+# ────────────────────────────────────────────────────────────────────────────
+
+create_usage() {
+    cat <<'EOF'
+USAGE:  jaah-vm create --name <hostname> [options]
+
+REQUIRED:
+    --name <n>          VM hostname (lowercase a-z 0-9 -, 1-63 chars)
+
+VISIBLE OPTIONS (with defaults):
+    --type <preset>             default: small  (see `jaah-vm types`)
+    --env <dev|staging|prod>    optional tag, no other side-effect (yet)
+    --snippet <path>            cloud-init user-data file (validated, replaces base)
+    --set-password              opt-in password auth (default: SSH-key-only)
+    --start                     boot after creation
+    --wait-ssh                  implies --start; default timeout 180s
+    --dry-run                   print the qm commands; no execution; no lock acquired
+    --json                      machine-readable output: {vmid,name,ip,ssh,...}
+    --replace                   destroy existing same-name VM first (HMAC + typed confirm)
+    --advanced                  show ALL options in --help
+
+EXAMPLES:
+    # Smallest VM, key-only auth, no boot
+    jaah-vm create --name web-01
+
+    # Larger, started, with SSH wait
+    jaah-vm create --name db-01 --type large --start --wait-ssh
+
+    # Custom cloud-init user-data (e.g. install nginx on first boot)
+    jaah-vm create --name app-01 --snippet ./nginx-user.yaml --snippet-allow-exec --start
+
+    # Dev environment tag
+    jaah-vm create --name test-01 --env dev --start --wait-ssh
+
+    # Replace an existing managed VM with the same name
+    jaah-vm create --name web-01 --replace --start
+EOF
+}
+
+create_advanced_usage() {
+    create_usage
+    cat <<'EOF'
+
+ADVANCED OPTIONS:
+    --vmid <id>                          specific VMID (default: cluster nextid)
+    --cores <n>                          override preset cores
+    --memory <mb>                        override preset memory (MB)
+    --disk <NG>                          override preset root disk (e.g. 50G)
+    --storage <name>                     default: vm-fast (per-node ZFS)
+    --bridge <name>                      default: vmbr0
+    --vlan <tag>                         VLAN id (1-4094) → net0,tag=N
+    --ip <CIDR|dhcp>                     default: dhcp
+    --gw <ip>                            default: 192.168.1.99
+    --dns "<a b>"                        default: "192.168.1.99 1.1.1.1"
+    --cpu <type>                         default: x86-64-v2-AES (migration-safe)
+    --i-know-this-breaks-migration       required to set --cpu host (persistent tag)
+    --ssh-timeout <sec>                  default 180s
+    --node <hostname>                    target cluster node (default: current)
+    --snippet-allow-exec                 permit runcmd/bootcmd/write_files in --snippet
+    --tags <a,b>                         extra tags (always merged with managed-by-jaah-vm)
+EOF
+}
+
+# Defaults
+DEFAULT_TYPE="small"
+DEFAULT_BRIDGE="vmbr0"
+DEFAULT_STORAGE="vm-fast"
+DEFAULT_GW="192.168.1.99"
+DEFAULT_DNS="192.168.1.99 1.1.1.1"
+DEFAULT_IP="dhcp"
+DEFAULT_CPU="x86-64-v2-AES"
+DEFAULT_SSH_TIMEOUT=180
+DEFAULT_USER="ibra"
+
+cmd_create() {
+    # Parse args
+    local NAME="" VMID="" TYPE="$DEFAULT_TYPE"
+    local CORES="" MEMORY="" DISK_GB=""
+    local STORAGE="$DEFAULT_STORAGE" BRIDGE="$DEFAULT_BRIDGE" VLAN=""
+    local IPCFG="$DEFAULT_IP" GW="$DEFAULT_GW" DNS="$DEFAULT_DNS"
+    local CPU_TYPE="$DEFAULT_CPU" ALLOW_HOST_CPU="no"
+    local SSHTIMEOUT="$DEFAULT_SSH_TIMEOUT"
+    local TARGET_NODE="" ENV_TAG=""
+    local SNIPPET="" ALLOW_SNIPPET_EXEC="no"
+    local SET_PASSWORD="no"
+    local START_VM="no" WAIT_SSH="no"
+    local DRY_RUN="no" JSON_OUT="no" REPLACE="no"
+    local EXTRA_TAGS="" SHOW_ADVANCED="no"
+    local recipe_argv=( "$@" )
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)          NAME="$2"; shift 2;;
+            --vmid)          VMID="$2"; shift 2;;
+            --type)          TYPE="$2"; shift 2;;
+            --env)           ENV_TAG="$2"; shift 2;;
+            --cores)         CORES="$2"; shift 2;;
+            --memory)        MEMORY="$2"; shift 2;;
+            --disk)          DISK_GB="${2%G}"; shift 2;;
+            --storage)       STORAGE="$2"; shift 2;;
+            --bridge)        BRIDGE="$2"; shift 2;;
+            --vlan)          VLAN="$2"; shift 2;;
+            --ip)            IPCFG="$2"; shift 2;;
+            --gw)            GW="$2"; shift 2;;
+            --dns)           DNS="$2"; shift 2;;
+            --cpu)           CPU_TYPE="$2"; shift 2;;
+            --i-know-this-breaks-migration) ALLOW_HOST_CPU="yes"; shift;;
+            --ssh-timeout)   SSHTIMEOUT="$2"; shift 2;;
+            --node)          TARGET_NODE="$2"; shift 2;;
+            --snippet)       SNIPPET="$2"; shift 2;;
+            --snippet-allow-exec) ALLOW_SNIPPET_EXEC="yes"; shift;;
+            --set-password)  SET_PASSWORD="yes"; shift;;
+            --start)         START_VM="yes"; shift;;
+            --wait-ssh)      WAIT_SSH="yes"; START_VM="yes"; shift;;
+            --dry-run)       DRY_RUN="yes"; shift;;
+            --json)          JSON_OUT="yes"; shift;;
+            --replace)       REPLACE="yes"; shift;;
+            --tags)          EXTRA_TAGS="$2"; shift 2;;
+            --advanced)      SHOW_ADVANCED="yes"; shift;;
+            --help|-h)
+                if [ "$SHOW_ADVANCED" = "yes" ]; then create_advanced_usage; else create_usage; fi
+                exit 0;;
+            *) fail "Unknown create flag: $1  (try --help)";;
+        esac
+    done
+
+    # Required + validation
+    [ -n "$NAME" ] || { create_usage; fail "--name is required"; }
+    validate_name "$NAME"
+
+    [ -z "$ENV_TAG" ] || [[ "$ENV_TAG" =~ ^(dev|staging|prod)$ ]] || fail "--env must be dev|staging|prod"
+
+    # CPU=host guard with persistent tag
+    if [ "$CPU_TYPE" = "host" ] && [ "$ALLOW_HOST_CPU" != "yes" ]; then
+        fail "--cpu host disables cluster-wide live migration. Add --i-know-this-breaks-migration to confirm, or use --cpu x86-64-v2-AES (default)."
+    fi
+
+    # Preset → cores/memory/disk (overridable)
+    [ -n "$CORES"   ] || CORES=$(preset_cores "$TYPE")   || fail "Unknown --type '$TYPE'"
+    [ -n "$MEMORY"  ] || MEMORY=$(preset_memory "$TYPE") || fail "Unknown --type '$TYPE'"
+    [ -n "$DISK_GB" ] || DISK_GB=$(preset_disk "$TYPE")  || fail "Unknown --type '$TYPE'"
+
+    # VLAN validation
+    if [ -n "$VLAN" ]; then
+        [[ "$VLAN" =~ ^[0-9]+$ ]] && [ "$VLAN" -ge 1 ] && [ "$VLAN" -le 4094 ] \
+            || fail "Invalid --vlan '$VLAN' (must be 1-4094)"
+    fi
+
+    # SSH timeout validation
+    [[ "$SSHTIMEOUT" =~ ^[0-9]+$ ]] || fail "--ssh-timeout must be a number"
+
+    # Ensure cluster + quorum + state dirs
+    require_root
+    require_cluster_member
+    require_quorum
+    feature_detect
+    ensure_state_dirs
+
+    # Pre-flight: secrets, HMAC key, SSH key
+    check_secrets_safe
+    local SSHKEY="${JAAH_KEYS_DIR}/default.pub"
+    [ -r "$SSHKEY" ] || fail "Default SSH key missing: $SSHKEY"
+
+    # Storage + free space
+    storage_active "$STORAGE" || fail "Target storage '$STORAGE' not active on $(hostname -s)"
+    local free_mb need_mb
+    free_mb=$(storage_free_mb "$STORAGE")
+    need_mb=$((DISK_GB * 1024 + 512))   # +512 for EFI/cloud-init
+    [ "$free_mb" -gt "$need_mb" ] || fail "Storage '$STORAGE' has ${free_mb} MB free, need ~${need_mb} MB"
+
+    # ZFS pool health (cheap)
+    if [ "$(storage_type "$STORAGE")" = "zfspool" ]; then
+        timeout 5 zpool status -x >/dev/null 2>&1 || warn "ZFS pool(s) unhealthy or status slow — proceed with caution"
+    fi
+
+    # Existing-name check (managed-VMs only)
+    local existing_vmid=""
+    if existing_vmid=$(resolve_target "$NAME" 2>/dev/null) && [ -n "$existing_vmid" ]; then
+        if [ "$REPLACE" = "yes" ]; then
+            warn "Name '$NAME' exists as VMID $existing_vmid — will replace"
+        else
+            fail "VM '$NAME' already exists (VMID $existing_vmid). Use --replace to overwrite."
+        fi
+    fi
+
+    # Validate snippet (if provided)
+    local VALIDATED_SNIPPET=""
+    if [ -n "$SNIPPET" ]; then
+        VALIDATED_SNIPPET=$(_validate_snippet "$SNIPPET" "$ALLOW_SNIPPET_EXEC")
+        warn "Custom snippet replaces base cloud-init — ensure it includes ssh_authorized_keys or you'll lock yourself out"
+    fi
+
+    # Build template lazily on first call
+    template_is_valid || build_template
+
+    # --dry-run: print plan, exit. NO LOCKS ACQUIRED.
+    if [ "$DRY_RUN" = "yes" ]; then
+        _print_plan "$NAME" "$CORES" "$MEMORY" "$DISK_GB" "$STORAGE" "$BRIDGE" "$VLAN" "$IPCFG" "$CPU_TYPE" "$ENV_TAG" "$VALIDATED_SNIPPET"
+        return 0
+    fi
+
+    # If --replace, destroy old VM first (HMAC verified)
+    if [ "$REPLACE" = "yes" ] && [ -n "$existing_vmid" ]; then
+        _destroy_managed "$existing_vmid" "$NAME" "force"
+    fi
+
+    # Acquire cluster lock for VMID allocation + clone
+    with_cluster_lock _do_create_locked \
+        "$NAME" "$VMID" "$CORES" "$MEMORY" "$DISK_GB" "$STORAGE" "$BRIDGE" "$VLAN" \
+        "$IPCFG" "$GW" "$DNS" "$CPU_TYPE" "$ALLOW_HOST_CPU" \
+        "$TARGET_NODE" "$ENV_TAG" "$VALIDATED_SNIPPET" "$SET_PASSWORD" \
+        "$EXTRA_TAGS" "$SSHKEY" "${recipe_argv[*]}"
+    local rc=$?
+    [ "$rc" -eq 0 ] || exit "$rc"
+
+    # VMID was set by _do_create_locked via a state file
+    local FINAL_VMID
+    FINAL_VMID=$(cat "${JAAH_RUN}/last-vmid" 2>/dev/null)
+    [ -n "$FINAL_VMID" ] || fail "Internal: VMID not recorded"
+
+    # Optional start + wait
+    if [ "$START_VM" = "yes" ]; then
+        log "Starting VM $FINAL_VMID"
+        qm start "$FINAL_VMID"
+        if [ "$WAIT_SSH" = "yes" ]; then
+            local IP
+            IP=$(_wait_for_ip "$FINAL_VMID" "$SSHTIMEOUT")
+            if [ -n "$IP" ]; then
+                if _wait_for_ssh "$IP" "$DEFAULT_USER" "$SSHTIMEOUT"; then
+                    _print_launch_summary "$FINAL_VMID" "$NAME" "$TYPE" "$CORES" "$MEMORY" "$DISK_GB" "$IP" "$STORAGE" "$JSON_OUT"
+                else
+                    warn "VM started but SSH not yet reachable on $IP — cloud-init may still be running"
+                    _show_cloudinit_status "$FINAL_VMID"
+                    _print_launch_summary "$FINAL_VMID" "$NAME" "$TYPE" "$CORES" "$MEMORY" "$DISK_GB" "$IP" "$STORAGE" "$JSON_OUT"
+                fi
+            else
+                warn "VM started but no IP detected within ${SSHTIMEOUT}s"
+                _show_cloudinit_status "$FINAL_VMID"
+            fi
+        else
+            ok "VM $FINAL_VMID ($NAME) started (no SSH wait)"
+        fi
+    else
+        ok "VM $FINAL_VMID ($NAME) created (not started). Start: qm start $FINAL_VMID"
+    fi
+}
+
+# Inner clone routine — runs inside cluster lock.
+_do_create_locked() {
+    local NAME="$1" VMID="$2" CORES="$3" MEMORY="$4" DISK_GB="$5"
+    local STORAGE="$6" BRIDGE="$7" VLAN="$8"
+    local IPCFG="$9" GW="${10}" DNS="${11}"
+    local CPU_TYPE="${12}" ALLOW_HOST_CPU="${13}"
+    local TARGET_NODE="${14}" ENV_TAG="${15}" VALIDATED_SNIPPET="${16}"
+    local SET_PASSWORD="${17}" EXTRA_TAGS="${18}" SSHKEY="${19}"
+    local RECIPE_ARGV="${20}"
+
+    # Allocate VMID if not supplied
+    local VMID_WAS_NEW=0
+    if [ -z "$VMID" ]; then
+        VMID=$(allocate_vmid)
+        VMID_WAS_NEW=1
+    elif ! _vmid_in_use "$VMID"; then
+        VMID_WAS_NEW=1
+    else
+        fail "Requested VMID $VMID already in use"
+    fi
+
+    # Setup rollback BEFORE any destructive op.
+    # shellcheck disable=SC2034  # used by trap
+    VMID_TO_ROLLBACK="$VMID"
+    # shellcheck disable=SC2034  # used by trap
+    JAAH_ROLLBACK_NEW="$VMID_WAS_NEW"
+    trap '_on_create_err $LINENO "$BASH_COMMAND" $?' ERR
+
+    log "Cloning VMID=$VMID name=$NAME from template ${TEMPLATE_VMID}"
+
+    local clone_args=( "$TEMPLATE_VMID" "$VMID" --name "$NAME" --full true --storage "$STORAGE" )
+    [ -n "$TARGET_NODE" ] && clone_args+=( --target "$TARGET_NODE" )
+    qm clone "${clone_args[@]}"
+
+    log "  + resources: cores=$CORES memory=$MEMORY"
+    qm set "$VMID" --cores "$CORES" --memory "$MEMORY" --cpu "$CPU_TYPE" >/dev/null
+
+    # Network
+    local net0="virtio,bridge=$BRIDGE"
+    [ -n "$VLAN" ] && net0="${net0},tag=${VLAN}"
+    log "  + network: $net0  ip=$IPCFG"
+    qm set "$VMID" --net0 "$net0" >/dev/null
+    if [ "$IPCFG" = "dhcp" ]; then
+        qm set "$VMID" --ipconfig0 "ip=dhcp" >/dev/null
+    else
+        qm set "$VMID" --ipconfig0 "ip=${IPCFG},gw=${GW}" >/dev/null
+    fi
+    qm set "$VMID" --nameserver "$DNS" >/dev/null
+
+    # Resize disk if larger than template default (20G)
+    if [ "$DISK_GB" -gt 20 ]; then
+        log "  + resize root to ${DISK_GB}G"
+        qm resize "$VMID" scsi0 "${DISK_GB}G" >/dev/null
+    fi
+
+    # SSH key
+    qm set "$VMID" --sshkeys "$SSHKEY" >/dev/null
+
+    # Cloud-init: snippet OR base (S1: password via cicustom file, NEVER on argv)
+    if [ -n "$VALIDATED_SNIPPET" ]; then
+        log "  + custom cloud-init snippet: $VALIDATED_SNIPPET"
+        qm set "$VMID" --cicustom "user=${TEMPLATE_STORAGE}:snippets/jaah-vm/$(basename "$VALIDATED_SNIPPET")" >/dev/null
+    elif [ "$SET_PASSWORD" = "yes" ]; then
+        log "  + password auth ENABLED (via cicustom file, not argv)"
+        _write_password_snippet "$VMID" "$SSHKEY"
+    fi
+    # Default path: no cicustom; uses template's built-in user-data + the sshkeys we set above.
+
+    # Tags (build from validated components)
+    local tags="managed-by-jaah-vm,jaah,created-$(sanitize_tag "$(hostname -s)")-$(date -u +%Y%m%d)"
+    [ -n "$ENV_TAG" ] && tags="${tags},${ENV_TAG}"
+    [ "$CPU_TYPE" = "host" ] && tags="${tags},migration-incompatible"
+    if [ -n "$EXTRA_TAGS" ]; then
+        local extra_sanitized
+        extra_sanitized=$(printf '%s' "$EXTRA_TAGS" | tr ',' '\n' | while read -r t; do
+            sanitize_tag "$t"
+        done | tr '\n' ',' | sed 's/,$//')
+        tags="${tags},${extra_sanitized}"
+    fi
+    qm set "$VMID" --tags "$tags" >/dev/null
+
+    # VM description: 3 plain lines (markdown), with traceability
+    local desc
+    desc=$(cat <<EOF
+Created $(date -u +%FT%TZ) by $(whoami)@$(hostname -s) via jaah-vm v${JAAH_VM_VERSION}
+Recipe: jaah-vm create ${RECIPE_ARGV}
+Template: ${TEMPLATE_NAME} (VMID ${TEMPLATE_VMID})
+EOF
+)
+    qm set "$VMID" --description "$desc" >/dev/null
+
+    # Ownership manifest (HMAC anchor)
+    write_manifest "$VMID" "$NAME"
+
+    # Record recipe for `rerun`
+    install -m 700 -d "$JAAH_RECIPES"
+    echo "jaah-vm create ${RECIPE_ARGV}" > "${JAAH_RECIPES}/${VMID}.cmd"
+    chmod 600 "${JAAH_RECIPES}/${VMID}.cmd"
+
+    # Hand back VMID via state file (lock-scope variable visibility is limited)
+    echo "$VMID" > "${JAAH_RUN}/last-vmid"
+
+    # Clear rollback trap — VM is committed.
+    trap - ERR
+    VMID_TO_ROLLBACK=""
+
+    ok "VM $VMID ($NAME) created"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Rollback hook
+# ────────────────────────────────────────────────────────────────────────────
+
+_on_create_err() {
+    local line="$1" cmd="$2" rc="$3"
+    warn "Error at line $line (exit $rc): $(printf '%s' "$cmd" | sanitize_line)"
+    _rollback
+    exit "$rc"
+}
+
+_rollback() {
+    local v="${VMID_TO_ROLLBACK:-}"
+    [ -z "$v" ] && return 0
+    if [ "${JAAH_ROLLBACK_NEW:-0}" != "1" ]; then
+        warn "Refusing rollback on VMID $v — wasn't new when we started"
+        return 0
+    fi
+    log "Rolling back VMID=$v"
+    qm stop "$v" --skiplock --timeout 10 &>/dev/null || qm reset "$v" --skiplock &>/dev/null || true
+    sleep 1
+    qm destroy "$v" --purge 1 --destroy-unreferenced-disks 1 --skiplock &>/dev/null || true
+    # Anchored regex — never matches vm-100 against VMID=10
+    local ds
+    while IFS= read -r ds; do
+        log "  cleanup ZFS orphan: $ds"
+        zfs destroy "$ds" &>/dev/null || echo "$v $ds" >> "$JAAH_ORPHANS"
+    done < <(zfs list -H -o name 2>/dev/null | grep -E "/vm-${v}-disk-[0-9]+\$" || true)
+    remove_manifest "$v"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Snippet validation (S3)
+# ────────────────────────────────────────────────────────────────────────────
+
+_validate_snippet() {
+    local f="$1" allow_exec="$2"
+    local rp
+    rp=$(realpath -e "$f" 2>/dev/null) || fail "Snippet path not found: $f"
+    [ -r "$rp" ] || fail "Snippet not readable: $rp"
+
+    # YAML safety — python3 yaml.safe_load (no anchors-merge attack)
+    if command -v python3 >/dev/null; then
+        python3 -c "import yaml,sys; yaml.safe_load(open('$rp'))" 2>/dev/null \
+            || fail "Snippet is not valid YAML: $rp"
+    fi
+
+    # Default: reject code-execution keys
+    if [ "$allow_exec" != "yes" ]; then
+        if grep -qE '^[[:space:]]*(runcmd|bootcmd|write_files)[[:space:]]*:' "$rp"; then
+            fail "Snippet contains runcmd/bootcmd/write_files — re-run with --snippet-allow-exec"
+        fi
+    fi
+
+    # Copy to managed location, mode 600, name keyed by sha256
+    install -m 700 -d "$JAAH_SNIPPETS_PATH"
+    local sha base dest
+    sha=$(sha256sum "$rp" | awk '{print $1}' | cut -c1-12)
+    base=$(basename "$rp" .yaml)
+    base=$(sanitize_tag "$base")
+    dest="${JAAH_SNIPPETS_PATH}/$$-${sha}-${base}.yaml"
+    install -m 600 "$rp" "$dest"
+    printf '%s' "$dest"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Password handling (S1: file-based via --cicustom, NEVER on argv)
+# ────────────────────────────────────────────────────────────────────────────
+
+_write_password_snippet() {
+    local vmid="$1" sshkey="$2"
+    local pw
+    pw=$(read_secret VM_DEFAULT_PASSWORD)
+    [ -n "$pw" ] || fail "VM_DEFAULT_PASSWORD not set in $JAAH_SECRETS"
+
+    install -m 700 -d "$JAAH_RUN"
+    install -m 700 -d "$JAAH_SNIPPETS_PATH"
+
+    local tmp="${JAAH_RUN}/${vmid}-user.yaml"
+    local dest="${JAAH_SNIPPETS_PATH}/${vmid}-user.yaml"
+
+    # Guard set -x in case it's enabled by caller — never echo pw.
+    { set +x; } 2>/dev/null
+    {
+        echo "#cloud-config"
+        echo "users:"
+        echo "  - name: ${DEFAULT_USER}"
+        echo "    sudo: ALL=(ALL) NOPASSWD:ALL"
+        echo "    lock_passwd: false"
+        echo "    ssh_authorized_keys:"
+        sed 's/^/      - /' "$sshkey"
+        echo "chpasswd:"
+        echo "  expire: true"
+        echo "  list: |"
+        echo "    ${DEFAULT_USER}:${pw}"
+        echo "ssh_pwauth: true"
+    } > "$tmp"
+    chmod 600 "$tmp"
+
+    install -m 600 "$tmp" "$dest"
+    qm set "$vmid" --cicustom "user=${TEMPLATE_STORAGE}:snippets/jaah-vm/$(basename "$dest")" >/dev/null
+
+    shred -u "$tmp" 2>/dev/null || rm -f "$tmp"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Wait helpers
+# ────────────────────────────────────────────────────────────────────────────
+
+_wait_for_ip() {
+    local vmid="$1" budget="$2"
+    local deadline=$(( $(date +%s) + budget ))
+    local ip=""
+    log "Waiting up to ${budget}s for IP via qemu-guest-agent..."
+    while [ -z "$ip" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+        sleep 2
+        ip=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null \
+            | jq -r '.[]?.["ip-addresses"][]? | select(.["ip-address-type"]=="ipv4" and (.["ip-address"]|test("^192\\.168\\."))) | .["ip-address"]' 2>/dev/null \
+            | head -1)
+    done
+    # Fallback: ARP table on bridge
+    if [ -z "$ip" ]; then
+        local mac
+        mac=$(qm config "$vmid" | awk -F'macaddr=' '/^net0:/ {split($2,a,","); print a[1]}')
+        if [ -n "$mac" ]; then
+            ip=$(ip -4 neigh show 2>/dev/null | awk -v m="$(echo "$mac" | tr 'A-Z' 'a-z')" 'tolower($5)==m {print $1; exit}')
+        fi
+    fi
+    printf '%s' "$ip"
+}
+
+_wait_for_ssh() {
+    local ip="$1" user="$2" budget="$3"
+    local deadline=$(( $(date +%s) + budget ))
+    log "Waiting up to ${budget}s for SSH on ${user}@${ip}..."
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+               -o UserKnownHostsFile=/dev/null \
+               "${user}@${ip}" true 2>/dev/null; then
+            return 0
+        fi
+        sleep 3
+    done
+    return 1
+}
+
+_show_cloudinit_status() {
+    local vmid="$1"
+    local out
+    out=$(qm guest exec "$vmid" -- cloud-init status --wait 2>/dev/null \
+          | jq -r '."out-data" // empty' 2>/dev/null)
+    [ -n "$out" ] && log "cloud-init: $out"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Output helpers
+# ────────────────────────────────────────────────────────────────────────────
+
+_print_plan() {
+    local NAME="$1" CORES="$2" MEMORY="$3" DISK_GB="$4" STORAGE="$5" BRIDGE="$6" VLAN="$7" IPCFG="$8" CPU="$9" ENV_TAG="${10}" SNIPPET="${11}"
+    cat <<EOF
+─── jaah-vm create plan (dry-run, no execution) ───
+  name:     $NAME
+  type/res: ${CORES} cores  ${MEMORY} MB RAM  ${DISK_GB} GB disk
+  cpu:      $CPU
+  storage:  $STORAGE
+  network:  $BRIDGE${VLAN:+ (vlan=$VLAN)}  ip=$IPCFG
+  env:      ${ENV_TAG:-<none>}
+  snippet:  ${SNIPPET:-<base>}
+
+Would execute (in cluster lock):
+  qm clone $TEMPLATE_VMID <next-vmid> --name $NAME --full true --storage $STORAGE
+  qm set   <next-vmid>    --cores $CORES --memory $MEMORY --cpu $CPU
+  qm set   <next-vmid>    --net0 virtio,bridge=$BRIDGE${VLAN:+,tag=$VLAN}
+  qm set   <next-vmid>    --ipconfig0 ip=$IPCFG
+  qm resize <next-vmid>   scsi0 ${DISK_GB}G   (if > 20)
+  qm set   <next-vmid>    --tags managed-by-jaah-vm,jaah,...
+  write_manifest /etc/pve/jaah-vm/<next-vmid>.json (HMAC-signed)
+
+EOF
+}
+
+_print_launch_summary() {
+    local vmid="$1" name="$2" type="$3" cores="$4" memory="$5" disk="$6" ip="$7" storage="$8" json_out="$9"
+    if [ "$json_out" = "yes" ]; then
+        jq -n \
+            --arg vmid "$vmid" --arg name "$name" --arg ip "$ip" \
+            --arg ssh "ssh ibra@$ip" --arg storage "$storage" \
+            --arg version "$JAAH_VM_VERSION" \
+            '{vmid:($vmid|tonumber), name:$name, ip:$ip, ssh_command:$ssh,
+              storage:$storage, managed_by:"jaah-vm", version:$version}'
+        return
+    fi
+    cat <<EOF
+─────────────────────────────────────────────
+  ✓ Instance launched: $name (VMID $vmid)
+─────────────────────────────────────────────
+  Type:     $type (${cores} vCPU / ${memory} MB / ${disk} GB)
+  Node:     $(hostname -s)
+  IP:       $ip
+  Storage:  $storage
+
+  Connect:
+    ssh ibra@$ip
+    jaah-vm shell $name
+
+  Manage:
+    jaah-vm status  $name
+    jaah-vm destroy $name
+─────────────────────────────────────────────
+EOF
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `list`
+# ────────────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    local JSON_OUT="no"
+    [ "${1:-}" = "--json" ] && JSON_OUT="yes"
+
+    require_root
+    ensure_state_dirs
+
+    local entries=()
+    local m
+    for m in "$JAAH_MANIFEST_DIR"/*.json; do
+        [ -e "$m" ] || continue
+        local vmid name created
+        vmid=$(jq -r '.vmid' "$m" 2>/dev/null)    || continue
+        name=$(jq -r '.name' "$m" 2>/dev/null)    || continue
+        created=$(jq -r '.created' "$m" 2>/dev/null) || continue
+        # Skip if manifest exists but VM gone (orphan manifest)
+        qm config "$vmid" &>/dev/null || continue
+        local status
+        status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
+        entries+=( "$vmid|$name|$status|$created" )
+    done
+
+    if [ "$JSON_OUT" = "yes" ]; then
+        printf '['
+        local first=1
+        for e in "${entries[@]}"; do
+            IFS='|' read -r vmid name status created <<< "$e"
+            [ "$first" -eq 0 ] && printf ','
+            first=0
+            jq -nc --arg vmid "$vmid" --arg name "$name" --arg status "$status" --arg created "$created" \
+                '{vmid:($vmid|tonumber), name:$name, status:$status, created:$created}'
+        done
+        printf ']\n'
+        return 0
+    fi
+
+    if [ "${#entries[@]}" -eq 0 ]; then
+        echo "No managed VMs."
+        return 0
+    fi
+    printf '%-6s  %-24s  %-10s  %s\n' "VMID" "NAME" "STATUS" "CREATED"
+    for e in "${entries[@]}"; do
+        IFS='|' read -r vmid name status created <<< "$e"
+        printf '%-6s  %-24s  %-10s  %s\n' "$vmid" "$name" "$status" "$created"
+    done
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `status`
+# ────────────────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    local arg="${1:-}"
+    [ -n "$arg" ] || fail "Usage: jaah-vm status <name|vmid>"
+
+    require_root
+    ensure_state_dirs
+
+    local vmid
+    vmid=$(resolve_target "$arg") || fail "VM not found among managed: $arg"
+    is_managed "$vmid" || fail "VMID $vmid is not managed by jaah-vm"
+
+    echo "─── jaah-vm status: $arg ───"
+    qm config "$vmid" | grep -E '^(name|tags|cores|memory|cpu|net0|description|ipconfig0):' | sed 's/^/  /'
+    local s
+    s=$(qm status "$vmid" | awk '{print $2}')
+    echo "  status: $s"
+    if [ "$s" = "running" ]; then
+        local ip
+        ip=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null \
+            | jq -r '.[]?.["ip-addresses"][]? | select(.["ip-address-type"]=="ipv4" and (.["ip-address"]|test("^192\\.168\\."))) | .["ip-address"]' 2>/dev/null | head -1)
+        echo "  ip:     ${ip:-<not yet>}"
+    fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `shell`
+# ────────────────────────────────────────────────────────────────────────────
+
+cmd_shell() {
+    local arg="${1:-}"
+    [ -n "$arg" ] || fail "Usage: jaah-vm shell <name|vmid>"
+    local user="${DEFAULT_USER}"
+    if [ "${2:-}" = "--user" ]; then user="${3:-$user}"; fi
+
+    require_root
+    local vmid
+    vmid=$(resolve_target "$arg") || fail "VM not found: $arg"
+    is_managed "$vmid" || fail "VMID $vmid is not managed by jaah-vm"
+
+    local s
+    s=$(qm status "$vmid" | awk '{print $2}')
+    [ "$s" = "running" ] || fail "VM not running (status: $s) — start with: qm start $vmid"
+
+    local ip
+    ip=$(_wait_for_ip "$vmid" 30)
+    [ -n "$ip" ] || fail "No IPv4 found for $arg (agent + ARP fallback both failed). Check FortiGate DHCP leases."
+
+    log "Connecting to ${user}@${ip}..."
+    exec ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null "${user}@${ip}"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `destroy`
+# ────────────────────────────────────────────────────────────────────────────
+
+cmd_destroy() {
+    local arg="${1:-}" mode=""
+    [ -n "$arg" ] || fail "Usage: jaah-vm destroy <name|vmid> [--force]"
+    [ "${2:-}" = "--force" ] && mode="force"
+
+    require_root
+    require_cluster_member
+    require_quorum
+    ensure_state_dirs
+
+    local vmid
+    vmid=$(resolve_target "$arg") || fail "VM not found: $arg"
+    local name
+    name=$(jq -r '.name' "${JAAH_MANIFEST_DIR}/${vmid}.json" 2>/dev/null) || name="$arg"
+
+    _destroy_managed "$vmid" "$name" "$mode"
+}
+
+_destroy_managed() {
+    local vmid="$1" name="$2" mode="${3:-}"
+
+    verify_ownership "$vmid"
+
+    if [ "$mode" != "force" ]; then
+        echo "About to destroy: VMID=$vmid  name=$name  (managed by jaah-vm)"
+        read -r -p "Type the VM name to confirm: " typed
+        [ "$typed" = "$name" ] || fail "Confirmation mismatch — aborted"
+    fi
+
+    with_cluster_lock _do_destroy "$vmid" "$name"
+}
+
+_do_destroy() {
+    local vmid="$1" name="$2"
+    log "Destroying VMID=$vmid ($name)"
+    qm stop "$vmid" --skiplock --timeout 30 &>/dev/null || true
+    sleep 1
+    qm destroy "$vmid" --purge 1 --destroy-unreferenced-disks 1 --skiplock
+    # Clean snippet files for this VMID
+    rm -f "${JAAH_SNIPPETS_PATH}/${vmid}-user.yaml" 2>/dev/null || true
+    rm -f "${JAAH_RECIPES}/${vmid}.cmd" 2>/dev/null || true
+    remove_manifest "$vmid"
+    ok "Destroyed $vmid ($name)"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `rerun`
+# ────────────────────────────────────────────────────────────────────────────
+
+cmd_rerun() {
+    local arg="${1:-}"
+    [ -n "$arg" ] || fail "Usage: jaah-vm rerun <name|vmid>"
+
+    require_root
+    ensure_state_dirs
+
+    local vmid
+    vmid=$(resolve_target "$arg") || fail "VM not found among managed: $arg"
+    local recipe="${JAAH_RECIPES}/${vmid}.cmd"
+    [ -r "$recipe" ] || fail "No recipe recorded for $arg (VMID $vmid)"
+
+    local cmd_line
+    cmd_line=$(cat "$recipe")
+    echo "Recorded recipe for $arg:"
+    echo "  $cmd_line"
+    read -r -p "Re-run this command? Type 'yes' to confirm: " typed
+    [ "$typed" = "yes" ] || fail "Aborted"
+
+    # Re-exec ourselves with the recorded args (after stripping the leading 'jaah-vm create')
+    local self
+    self=$(readlink -f "$0")
+    # shellcheck disable=SC2086
+    eval "$self" $(echo "$cmd_line" | sed 's/^jaah-vm //')
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `doctor`
+# ────────────────────────────────────────────────────────────────────────────
+
+cmd_doctor() {
+    local mode="${1:-}"
+    require_root
+    ensure_state_dirs
+
+    echo "─── jaah-vm doctor ($JAAH_VM_VERSION) ───"
+
+    # Cluster + quorum
+    local rc=0
+    pvecm status >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 0 ] && echo "  [✓] Cluster reachable" || echo "  [✗] Not in cluster (jaah-vm requires cluster)"
+    rc=0
+    pvecm status 2>/dev/null | grep -q 'Quorate:.*Yes' || rc=$?
+    [ "$rc" -eq 0 ] && echo "  [✓] Cluster quorate" || echo "  [✗] Not quorate"
+
+    # Secrets
+    if [ -f "$JAAH_SECRETS" ]; then
+        local s; s=$(stat -c '%U:%a' "$JAAH_SECRETS" 2>/dev/null || echo "?")
+        [ "$s" = "root:600" ] && echo "  [✓] Secrets file mode/owner OK ($JAAH_SECRETS)" \
+                              || echo "  [✗] Secrets file mode bad ($JAAH_SECRETS = $s, want root:600)"
+    else
+        echo "  [✗] Secrets file missing: $JAAH_SECRETS"
+    fi
+
+    # HMAC key
+    if [ -r "$JAAH_HMAC_KEY" ]; then
+        local s; s=$(stat -c '%U:%a' "$JAAH_HMAC_KEY")
+        [ "$s" = "root:600" ] && echo "  [✓] HMAC key OK" \
+                              || echo "  [✗] HMAC key perms bad ($s)"
+    else
+        echo "  [✗] HMAC key missing: $JAAH_HMAC_KEY"
+    fi
+
+    # SSH key
+    [ -r "${JAAH_KEYS_DIR}/default.pub" ] && echo "  [✓] Default SSH key present" \
+                                          || echo "  [✗] Default SSH key missing (${JAAH_KEYS_DIR}/default.pub)"
+
+    # Storages
+    storage_active "$TEMPLATE_STORAGE" \
+        && echo "  [✓] Storage ${TEMPLATE_STORAGE} active ($(storage_free_mb "$TEMPLATE_STORAGE") MB free)" \
+        || echo "  [✗] Storage ${TEMPLATE_STORAGE} inactive"
+    storage_active "$DEFAULT_STORAGE" \
+        && echo "  [✓] Storage ${DEFAULT_STORAGE} active ($(storage_free_mb "$DEFAULT_STORAGE") MB free)" \
+        || echo "  [!] Storage ${DEFAULT_STORAGE} inactive on this node"
+
+    # Cloud image
+    [ -f "$CLOUD_IMG" ] && echo "  [✓] Cloud image present" \
+                       || echo "  [✗] Cloud image missing: $CLOUD_IMG"
+
+    # Template
+    if template_is_valid; then
+        echo "  [✓] Template VMID $TEMPLATE_VMID ($TEMPLATE_NAME) valid"
+    else
+        echo "  [!] Template missing or invalid — will rebuild on next create (or pass --rebuild-template)"
+    fi
+
+    # Orphans
+    if [ -s "$JAAH_ORPHANS" ]; then
+        echo "  [!] Orphans pending: $(wc -l < "$JAAH_ORPHANS") entries in $JAAH_ORPHANS"
+    else
+        echo "  [✓] No orphan VMIDs/disks"
+    fi
+
+    # Managed VMs with cpu=host
+    local count=0
+    for m in "$JAAH_MANIFEST_DIR"/*.json; do
+        [ -e "$m" ] || continue
+        local vmid; vmid=$(jq -r '.vmid' "$m" 2>/dev/null) || continue
+        qm config "$vmid" 2>/dev/null | grep -qE '^cpu:.*host' && count=$((count+1))
+    done
+    if [ "$count" -gt 0 ]; then
+        echo "  [!] $count managed VM(s) use cpu=host (migration-incompatible)"
+    fi
+
+    # PVE task logs leak check (for legacy v1 password references)
+    if [ -d /var/log/pve/tasks ] && grep -rEq -- '--cipassword' /var/log/pve/tasks 2>/dev/null; then
+        echo "  [!] PVE task logs contain historical --cipassword references (legacy v1)"
+    fi
+
+    # Optionally rebuild template
+    if [ "$mode" = "--rebuild-template" ]; then
+        echo ""
+        build_template force
+    fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Main dispatch
+# ────────────────────────────────────────────────────────────────────────────
+
+main() {
+    [ $# -eq 0 ] && { show_cheatsheet; exit 0; }
+
+    local sub="$1"; shift
+    case "$sub" in
+        create)   cmd_create "$@";;
+        rerun)    cmd_rerun "$@";;
+        list)     cmd_list "$@";;
+        status)   cmd_status "$@";;
+        shell)    cmd_shell "$@";;
+        destroy)  cmd_destroy "$@";;
+        doctor)   cmd_doctor "$@";;
+        types)    cmd_types;;
+        --version|-V|version)  cmd_version;;
+        --help|-h|help)        show_cheatsheet;;
+        *) fail "Unknown subcommand '$sub'. Run jaah-vm (no args) for the cheat sheet.";;
+    esac
+}
+
+main "$@"

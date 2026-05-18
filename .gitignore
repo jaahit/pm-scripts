@@ -1,0 +1,25 @@
+# Never commit real secrets
+*.key
+*.pem
+vm-secrets.env
+*.env
+!*.env.example
+!*.env.template
+
+# Local logs / state — must not enter git
+*.log
+/var/log/
+/var/lib/
+/etc/jaah/
+/run/jaah-vm/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+tests/.bats-tmp/

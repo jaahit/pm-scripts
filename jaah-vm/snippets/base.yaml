@@ -1,0 +1,19 @@
+#cloud-config
+# Base cloud-init user-data used when --snippet is NOT supplied.
+# This file is reference-only — jaah-vm relies on PVE's built-in cloud-init
+# generator (driven by qm set --ciuser / --sshkeys / --ipconfig0) for the
+# default path. This file documents the intended state.
+
+# Defaults applied via qm set; included here as reference for operators.
+package_update: true
+package_upgrade: false      # do not auto-upgrade on first boot (predictable VM)
+
+# qemu-guest-agent comes pre-installed in Ubuntu cloud images but may not
+# be enabled — explicitly enable.
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - timedatectl set-timezone Asia/Riyadh
+
+# Final state: SSH-key-only, password locked.
+ssh_pwauth: false
+disable_root: true
