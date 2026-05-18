@@ -81,8 +81,10 @@ _log_to() {
     printf '%s | %s | %-5s | %s\n' "$ts" "$host" "$level" "$msg" >> "$JAAH_LOG" 2>/dev/null || true
 }
 
-log()  { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;36m[*]\033[0m %s\n' "$m"; _log_to INFO  "$*"; }
-ok()   { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;32m[✓]\033[0m %s\n' "$m"; _log_to OK    "$*"; }
+# All status output goes to stderr so functions can return values via stdout
+# (e.g. `IP=$(_wait_for_ip ...)` without contaminating the captured value).
+log()  { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;36m[*]\033[0m %s\n' "$m" >&2; _log_to INFO  "$*"; }
+ok()   { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;32m[✓]\033[0m %s\n' "$m" >&2; _log_to OK    "$*"; }
 warn() { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;33m[!]\033[0m %s\n' "$m" >&2; _log_to WARN  "$*"; }
 fail() { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;31m[✗]\033[0m %s\n' "$m" >&2; _log_to ERROR "$*"; exit 1; }
 
