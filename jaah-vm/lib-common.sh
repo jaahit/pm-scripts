@@ -118,22 +118,22 @@ stage_done() {
     # stage_done [optional-note]
     local elapsed=$(( $(date +%s) - _STAGE_START_TIME ))
     local note="${1:-}"
-    local time_str=""
-    [ "$elapsed" -gt 1 ] && time_str=" \033[2m(${elapsed}s)\033[0m"
+    local prefix=' '
+    [ "$_STAGE_HAS_OUTPUT" -eq 1 ] && prefix='      '   # ✓ on its own indented line
 
-    if [ "$_STAGE_HAS_OUTPUT" -eq 0 ]; then
-        # No substep / progress was printed — append ✓ inline on the stage row
+    # Build the time suffix WITHOUT shoving escape codes through %s
+    # (printf %s does not interpret \033). Use printf to render directly.
+    if [ "$elapsed" -gt 1 ]; then
         if [ -n "$note" ]; then
-            printf ' \033[1;32m✓\033[0m %s%s\n' "$note" "$time_str" >&2
+            printf '%b\033[1;32m✓\033[0m %s \033[2m(%ds)\033[0m\n' "$prefix" "$note" "$elapsed" >&2
         else
-            printf ' \033[1;32m✓\033[0m%s\n' "$time_str" >&2
+            printf '%b\033[1;32m✓\033[0m \033[2m(%ds)\033[0m\n' "$prefix" "$elapsed" >&2
         fi
     else
-        # Substeps / progress were printed — ✓ on its own indented line
         if [ -n "$note" ]; then
-            printf '      \033[1;32m✓\033[0m %s%s\n' "$note" "$time_str" >&2
+            printf '%b\033[1;32m✓\033[0m %s\n' "$prefix" "$note" >&2
         else
-            printf '      \033[1;32m✓\033[0m%s\n' "$time_str" >&2
+            printf '%b\033[1;32m✓\033[0m\n' "$prefix" >&2
         fi
     fi
 }

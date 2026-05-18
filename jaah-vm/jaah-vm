@@ -18,7 +18,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.5.0"
+readonly JAAH_VM_VERSION="0.5.1"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -73,7 +73,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.5.0
+VERSION: jaah-vm v0.5.1
 EOF
 }
 
@@ -551,16 +551,26 @@ _do_create_locked() {
     fi
     qm set "$VMID" --nameserver "$DNS" >/dev/null
 
-    # Only resize UP — qm refuses to shrink. With a fresh template (~3.5G),
-    # any preset is bigger so resize succeeds. With an old 20G template, the
-    # tiny preset (10G) would fail; skip in that case.
-    local cur_gb
-    cur_gb=$(qm config "$VMID" 2>/dev/null | awk '/^scsi0:/' | grep -oE 'size=[0-9]+G' | head -1 | cut -d= -f2 | tr -d G)
-    if [ -n "$cur_gb" ] && [ "$DISK_GB" -gt "$cur_gb" ]; then
-        substep "resize root ${cur_gb} → ${DISK_GB} GB"
+    # Only resize UP — qm refuses to shrink. Parse the actual current size:
+    # qm prints sub-1G disks as size=3584M and bigger as size=20G — handle both.
+    local sz cur_mb target_mb cur_disp
+    sz=$(qm config "$VMID" 2>/dev/null | awk '/^scsi0:/' | grep -oE 'size=[0-9]+[MG]' | head -1 | cut -d= -f2)
+    case "$sz" in
+        *G) cur_mb=$(( ${sz%G} * 1024 )) ;;
+        *M) cur_mb=${sz%M} ;;
+        *)  cur_mb=0 ;;
+    esac
+    target_mb=$(( DISK_GB * 1024 ))
+    if [ "$cur_mb" -ge 1024 ]; then
+        cur_disp="$(( cur_mb / 1024 )) GB"
+    else
+        cur_disp="${cur_mb} MB"
+    fi
+    if [ "$cur_mb" -lt "$target_mb" ]; then
+        substep "resize root ${cur_disp} → ${DISK_GB} GB"
         qm resize "$VMID" scsi0 "${DISK_GB}G" >/dev/null
     else
-        substep "disk already ${cur_gb} GB (preset wants ${DISK_GB} GB, no shrink)"
+        substep "disk already ${cur_disp} (preset wants ${DISK_GB} GB, no shrink)"
     fi
 
     qm set "$VMID" --sshkeys "$SSHKEY" >/dev/null
