@@ -13,7 +13,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.3.1"
+readonly JAAH_VM_VERSION="0.3.2"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -57,7 +57,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.3.1
+VERSION: jaah-vm v0.3.2
 EOF
 }
 
@@ -94,10 +94,15 @@ preset_disk() { case "$1" in tiny) echo 10;; small) echo 20;; medium) echo 40;; 
 # ────────────────────────────────────────────────────────────────────────────
 
 cmd_version() {
+    # Installed binary lives under /usr/local/bin, which is NOT a git repo. The
+    # installer writes the SHA to a sidecar file at install time. Fall back to
+    # reading it from the source repo at /opt/pm-scripts if available.
     local sha="unknown"
-    local self_dir
-    self_dir=$(dirname "$(readlink -f "$0")")
-    sha=$(cd "$self_dir" 2>/dev/null && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    if [ -r /usr/local/lib/jaah-vm/git-sha ]; then
+        sha=$(cat /usr/local/lib/jaah-vm/git-sha)
+    elif [ -d /opt/pm-scripts/.git ]; then
+        sha=$(git -C /opt/pm-scripts rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    fi
     echo "jaah-vm v${JAAH_VM_VERSION}  (git ${sha})"
 }
 

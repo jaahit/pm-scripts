@@ -67,6 +67,12 @@ log "Installing /usr/local/lib/jaah-vm/"
 install -d -o root -g root -m 755 /usr/local/lib/jaah-vm
 install -o root -g root -m 644 "$SELF_DIR/lib-common.sh" /usr/local/lib/jaah-vm/
 
+# Embed git SHA so `jaah-vm --version` shows it without git working tree.
+if git -C "$SELF_DIR/.." rev-parse --short HEAD &>/dev/null; then
+    SHA=$(git -C "$SELF_DIR/.." rev-parse --short HEAD)
+    install -o root -g root -m 644 /dev/stdin /usr/local/lib/jaah-vm/git-sha <<< "$SHA"
+fi
+
 log "Installing bash completion"
 install -o root -g root -m 644 "$SELF_DIR/completion.bash" /etc/bash_completion.d/jaah-vm
 

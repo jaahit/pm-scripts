@@ -270,10 +270,10 @@ storage_type() {
     pvesm status -storage "$1" 2>/dev/null | awk 'NR>1{print $2}'
 }
 
-# storage_free_mb <name>
+# storage_free_mb <name> — returns AVAILABLE space, not used. (column 6 from pvesm)
 storage_free_mb() {
     local kb
-    kb=$(pvesm status -storage "$1" 2>/dev/null | awk 'NR>1{print $5}')
+    kb=$(pvesm status -storage "$1" 2>/dev/null | awk 'NR>1{print $6}')
     echo $(( ${kb:-0} / 1024 ))
 }
 
