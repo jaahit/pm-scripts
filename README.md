@@ -8,13 +8,13 @@ One tool per folder. Each is self-contained: source, installer, tests, docs.
 
 | Tool | Purpose | Latest |
 |---|---|---|
-| [`jaah-vm/`](jaah-vm/) | Mini AWS-EC2-style VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.4.8`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.4.8/jaah-vm) |
+| [`jaah-vm/`](jaah-vm/) | Proxmox VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.4.8`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.4.8/jaah-vm) |
 
 ---
 
 ## How to use — `jaah-vm`
 
-### 1. Install (one-time per cluster node, or whenever you want to update)
+### 1. Install (one-time per node, or whenever you want to update)
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- jaah-vm
