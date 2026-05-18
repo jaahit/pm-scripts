@@ -14,7 +14,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.4.5"
+readonly JAAH_VM_VERSION="0.4.6"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -63,7 +63,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.4.5
+VERSION: jaah-vm v0.4.6
 EOF
 }
 
@@ -223,9 +223,9 @@ build_template() {
     log "  + boot order"
     qm set "$TEMPLATE_VMID" --boot "order=scsi0" >/dev/null
 
-    log "  + base resize to 20G"
-    qm resize "$TEMPLATE_VMID" scsi0 20G >/dev/null
-
+    # Do NOT resize the template here. The cloud image is ~3.5 GB; resizing to
+    # 20 GB would force every full-clone to transfer 20 GB (mostly zeros) over
+    # NFS. Each VM resizes its own disk to the preset target after cloning.
     log "  + convert to template"
     qm template "$TEMPLATE_VMID" >/dev/null
 
@@ -530,11 +530,11 @@ _do_create_locked() {
     fi
     qm set "$VMID" --nameserver "$DNS" >/dev/null
 
-    # Resize disk if larger than template default (20G)
-    if [ "$DISK_GB" -gt 20 ]; then
-        log "  + resize root to ${DISK_GB}G"
-        qm resize "$VMID" scsi0 "${DISK_GB}G" >/dev/null
-    fi
+    # Always resize the cloned disk to the preset target. Template ships at
+    # its natural cloud-image size (~3.5 GB) so clones transfer faster; the
+    # resize itself is an instant metadata op + filesystem grow on first boot.
+    log "  + resize root to ${DISK_GB}G"
+    qm resize "$VMID" scsi0 "${DISK_GB}G" >/dev/null
 
     # SSH key
     qm set "$VMID" --sshkeys "$SSHKEY" >/dev/null
