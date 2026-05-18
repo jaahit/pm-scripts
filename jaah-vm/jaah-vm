@@ -14,7 +14,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.4.2"
+readonly JAAH_VM_VERSION="0.4.3"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -63,7 +63,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.4.2
+VERSION: jaah-vm v0.4.3
 EOF
 }
 
@@ -162,14 +162,34 @@ build_template() {
         --localtime 0 \
         --tags "jaah,template"
 
-    # Import + attach the cloud image as scsi0 in one step.
+    # Pre-customize the cloud image so all clones boot correctly:
+    #   - net.ifnames=0  → NIC is named 'eth0' (PVE writes network-data with
+    #     name: eth0; Ubuntu's predictable-names like enp0s18 break DHCP).
+    #   - qemu-guest-agent enabled  → PVE can query IP / cloud-init state.
+    # Staged in /tmp so we don't mutate the shared iso-library image.
+    log "  + customize image (eth0 + qga)"
+    local STAGED_IMG="/tmp/jaah-vm-template-staged.img"
+    cp -f "$CLOUD_IMG" "$STAGED_IMG"
+    if ! command -v virt-customize >/dev/null; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libguestfs-tools >/dev/null 2>&1 \
+            || warn "libguestfs-tools missing — qga + predictable-names won't be auto-configured"
+    fi
+    if command -v virt-customize >/dev/null; then
+        virt-customize -a "$STAGED_IMG" \
+            --run-command 'sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"net.ifnames=0 biosdevname=0 |" /etc/default/grub' \
+            --run-command 'update-grub 2>/dev/null || true' \
+            --run-command 'systemctl enable qemu-guest-agent.service 2>/dev/null || true' \
+            --truncate /etc/machine-id \
+            >/dev/null 2>&1 || warn "virt-customize had warnings (proceeding)"
+    fi
+
+    # Import + attach the customized image as scsi0 in one step.
     # Using --scsi0 ${STORAGE}:0,import-from=<path>... avoids the EFI/cloud-image
-    # disk-number collision that the older `qm importdisk` flow produces on NFS
-    # (both end up as disk-0 with different extensions, and qm set then can't
-    # locate the second one).
-    log "  + import cloud image as scsi0"
+    # disk-number collision that the older `qm importdisk` flow produced on NFS.
+    log "  + import customized image as scsi0"
     qm set "$TEMPLATE_VMID" \
-        --scsi0 "${TEMPLATE_STORAGE}:0,import-from=${CLOUD_IMG},discard=on,ssd=1,iothread=1" >/dev/null
+        --scsi0 "${TEMPLATE_STORAGE}:0,import-from=${STAGED_IMG},discard=on,ssd=1,iothread=1" >/dev/null
+    rm -f "$STAGED_IMG"
 
     log "  + EFI disk"
     qm set "$TEMPLATE_VMID" --efidisk0 "${TEMPLATE_STORAGE}:1,efitype=4m,pre-enrolled-keys=0" >/dev/null
