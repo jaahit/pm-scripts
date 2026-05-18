@@ -14,7 +14,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.4.7"
+readonly JAAH_VM_VERSION="0.4.8"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -63,7 +63,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.4.7
+VERSION: jaah-vm v0.4.8
 EOF
 }
 
@@ -125,6 +125,12 @@ template_is_valid() {
     qm config "$TEMPLATE_VMID" | grep -qE '^template:\s*1' || return 1
     qm config "$TEMPLATE_VMID" | grep -qE "^name:\s*${TEMPLATE_NAME}\$" || return 1
     qm config "$TEMPLATE_VMID" | grep -qE '^tags:.*template' || return 1
+    # Reject templates from v0.4.5 and earlier (scsi0 was bloated to 20G).
+    # Modern templates keep the natural ~3.5G cloud-image size.
+    local sz
+    sz=$(qm config "$TEMPLATE_VMID" 2>/dev/null | awk '/^scsi0:/' | grep -oE 'size=[0-9]+G' | head -1 | cut -d= -f2 | tr -d G)
+    [ -n "$sz" ] && [ "$sz" -le 5 ] || return 1
+    return 0
 }
 
 build_template() {
@@ -461,13 +467,14 @@ cmd_create() {
             if [ -n "$IP" ]; then
                 stage_done "$IP"
                 stage_start 8 "Waiting for SSH on ${DEFAULT_USER}@${IP}"
-                if _wait_for_ssh "$IP" "$DEFAULT_USER" "$SSHTIMEOUT"; then
-                    stage_done
-                else
-                    progress_clear
-                    printf '      \033[1;33m!\033[0m SSH not yet reachable on %s — cloud-init may still be running\n' "$IP" >&2
-                    _show_cloudinit_status "$FINAL_VMID"
-                fi
+                local ssh_rc=0
+                _wait_for_ssh "$IP" "$DEFAULT_USER" "$SSHTIMEOUT" || ssh_rc=$?
+                case "$ssh_rc" in
+                    0) stage_done ;;
+                    2) stage_done "SSH up — auth needs the private key you saved" ;;
+                    *) stage_done "SSH not reachable within ${SSHTIMEOUT}s"
+                       _show_cloudinit_status "$FINAL_VMID" ;;
+                esac
                 _print_launch_summary "$FINAL_VMID" "$NAME" "$TYPE" "$CORES" "$MEMORY" "$DISK_GB" "$IP" "$STORAGE" "$JSON_OUT"
             else
                 stage_done "no IP within ${SSHTIMEOUT}s"
@@ -534,8 +541,17 @@ _do_create_locked() {
     fi
     qm set "$VMID" --nameserver "$DNS" >/dev/null
 
-    substep "resize root to ${DISK_GB} GB"
-    qm resize "$VMID" scsi0 "${DISK_GB}G" >/dev/null
+    # Only resize UP — qm refuses to shrink. With a fresh template (~3.5G),
+    # any preset is bigger so resize succeeds. With an old 20G template, the
+    # tiny preset (10G) would fail; skip in that case.
+    local cur_gb
+    cur_gb=$(qm config "$VMID" 2>/dev/null | awk '/^scsi0:/' | grep -oE 'size=[0-9]+G' | head -1 | cut -d= -f2 | tr -d G)
+    if [ -n "$cur_gb" ] && [ "$DISK_GB" -gt "$cur_gb" ]; then
+        substep "resize root ${cur_gb} → ${DISK_GB} GB"
+        qm resize "$VMID" scsi0 "${DISK_GB}G" >/dev/null
+    else
+        substep "disk already ${cur_gb} GB (preset wants ${DISK_GB} GB, no shrink)"
+    fi
 
     qm set "$VMID" --sshkeys "$SSHKEY" >/dev/null
 
@@ -702,7 +718,7 @@ _wait_for_ip() {
     local vmid="$1" budget="$2"
     local deadline=$(( $(date +%s) + budget ))
     local ip=""
-    log "Waiting up to ${budget}s for IP via qemu-guest-agent..."
+    # No log() here — caller already opened a stage header.
     while [ -z "$ip" ] && [ "$(date +%s)" -lt "$deadline" ]; do
         sleep 2
         ip=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null \
@@ -721,14 +737,24 @@ _wait_for_ip() {
 }
 
 _wait_for_ssh() {
+    # Exit codes:
+    #   0 = full success (TCP open + auth OK)
+    #   2 = SSH reachable (TCP open) but auth denied (key mismatch — common when
+    #       a fresh keypair was generated and the caller doesn't hold the private key)
+    #   1 = SSH never became reachable within budget
     local ip="$1" user="$2" budget="$3"
     local deadline=$(( $(date +%s) + budget ))
-    log "Waiting up to ${budget}s for SSH on ${user}@${ip}..."
+    local out rc
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-               -o UserKnownHostsFile=/dev/null \
-               "${user}@${ip}" true 2>/dev/null; then
-            return 0
+        if timeout 3 bash -c "</dev/tcp/${ip}/22" 2>/dev/null; then
+            out=$(ssh -o BatchMode=yes -o ConnectTimeout=5 \
+                      -o StrictHostKeyChecking=accept-new \
+                      -o UserKnownHostsFile=/dev/null \
+                      "${user}@${ip}" true 2>&1)
+            rc=$?
+            [ "$rc" -eq 0 ] && return 0
+            # Permission denied → SSH is up, key just doesn't match. Don't keep retrying.
+            printf '%s' "$out" | grep -q -i 'permission denied' && return 2
         fi
         sleep 3
     done

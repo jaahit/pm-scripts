@@ -94,33 +94,58 @@ fail() { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;31m[✗]
 #         └─ <transient progress / sub-bullet>
 _STAGE_TOTAL=8
 _STAGE_START_TIME=0
+_STAGE_HAS_OUTPUT=0   # 1 = a substep / progress / extra-line was printed (so ✓ goes on its own line)
 
 stage_start() {
     # stage_start <num> <description>
     local num="$1"; shift
     _STAGE_START_TIME=$(date +%s)
-    printf '\033[1;36m[%d/%d]\033[0m %s\n' "$num" "$_STAGE_TOTAL" "$*" >&2
+    _STAGE_HAS_OUTPUT=0
+    # Open the line WITHOUT a newline so stage_done can append the ✓ inline
+    printf '\033[1;36m[%d/%d]\033[0m %s' "$num" "$_STAGE_TOTAL" "$*" >&2
     _log_to INFO "stage $num/$_STAGE_TOTAL: $*"
+}
+
+# Mark that we printed extra output beneath the stage header so ✓ should go on its own line
+_stage_break() {
+    if [ "$_STAGE_HAS_OUTPUT" -eq 0 ]; then
+        printf '\n' >&2
+        _STAGE_HAS_OUTPUT=1
+    fi
 }
 
 stage_done() {
     # stage_done [optional-note]
     local elapsed=$(( $(date +%s) - _STAGE_START_TIME ))
     local note="${1:-}"
-    if [ -n "$note" ]; then
-        printf '      \033[1;32m✓\033[0m %s \033[2m(%ds)\033[0m\n' "$note" "$elapsed" >&2
-    elif [ "$elapsed" -gt 1 ]; then
-        printf '      \033[1;32m✓\033[0m \033[2m(%ds)\033[0m\n' "$elapsed" >&2
+    local time_str=""
+    [ "$elapsed" -gt 1 ] && time_str=" \033[2m(${elapsed}s)\033[0m"
+
+    if [ "$_STAGE_HAS_OUTPUT" -eq 0 ]; then
+        # No substep / progress was printed — append ✓ inline on the stage row
+        if [ -n "$note" ]; then
+            printf ' \033[1;32m✓\033[0m %s%s\n' "$note" "$time_str" >&2
+        else
+            printf ' \033[1;32m✓\033[0m%s\n' "$time_str" >&2
+        fi
     else
-        printf '      \033[1;32m✓\033[0m\n' >&2
+        # Substeps / progress were printed — ✓ on its own indented line
+        if [ -n "$note" ]; then
+            printf '      \033[1;32m✓\033[0m %s%s\n' "$note" "$time_str" >&2
+        else
+            printf '      \033[1;32m✓\033[0m%s\n' "$time_str" >&2
+        fi
     fi
 }
 
-substep()  { printf '      \033[2m• %s\033[0m\n' "$*" >&2; }
+substep() {
+    _stage_break
+    printf '      \033[2m• %s\033[0m\n' "$*" >&2
+}
 
-# Print a transient "in-progress" line that the next print can overwrite.
-# Use \r in the next println via `progress` to redraw.
+# Transient progress that self-overwrites via \r. Caller must end with progress_clear.
 progress() {
+    _stage_break
     printf '\r\033[K      \033[2m└─ %s\033[0m' "$*" >&2
 }
 progress_clear() { printf '\r\033[K' >&2; }
@@ -138,6 +163,7 @@ filter_qm_clone() {
             "create full clone of drive "*|"allocated target volume"*|"creating a clone"*|"generating cloud-init"*|"")
                 : ;; # silence — they're chatty and add nothing
             *)
+                _stage_break
                 progress_clear
                 printf '      \033[2m%s\033[0m\n' "$line" >&2
                 ;;
