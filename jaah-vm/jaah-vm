@@ -14,7 +14,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.4.0"
+readonly JAAH_VM_VERSION="0.4.1"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -63,7 +63,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.4.0
+VERSION: jaah-vm v0.4.1
 EOF
 }
 
@@ -162,20 +162,17 @@ build_template() {
         --localtime 0 \
         --tags "jaah,template"
 
+    # Import + attach the cloud image as scsi0 in one step.
+    # Using --scsi0 ${STORAGE}:0,import-from=<path>... avoids the EFI/cloud-image
+    # disk-number collision that the older `qm importdisk` flow produces on NFS
+    # (both end up as disk-0 with different extensions, and qm set then can't
+    # locate the second one).
+    log "  + import cloud image as scsi0"
+    qm set "$TEMPLATE_VMID" \
+        --scsi0 "${TEMPLATE_STORAGE}:0,import-from=${CLOUD_IMG},discard=on,ssd=1,iothread=1" >/dev/null
+
     log "  + EFI disk"
     qm set "$TEMPLATE_VMID" --efidisk0 "${TEMPLATE_STORAGE}:1,efitype=4m,pre-enrolled-keys=0" >/dev/null
-
-    log "  + import cloud image (qcow2)"
-    qm importdisk "$TEMPLATE_VMID" "$CLOUD_IMG" "$TEMPLATE_STORAGE" --format qcow2 >/dev/null
-
-    local imported
-    imported=$(qm config "$TEMPLATE_VMID" | awk -F': ' '/^unused0:/ {print $2}')
-    [ -n "$imported" ] || fail "Template import failed — no unused0 disk found"
-
-    log "  + attach as scsi0  ($imported)"
-    qm set "$TEMPLATE_VMID" \
-        --scsi0 "${imported},discard=on,ssd=1,iothread=1" \
-        --delete unused0 >/dev/null
 
     log "  + cloud-init drive"
     qm set "$TEMPLATE_VMID" --ide2 "${TEMPLATE_STORAGE}:cloudinit" >/dev/null
