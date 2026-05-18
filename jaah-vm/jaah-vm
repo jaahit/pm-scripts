@@ -14,7 +14,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.4.3"
+readonly JAAH_VM_VERSION="0.4.4"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -63,7 +63,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.4.3
+VERSION: jaah-vm v0.4.4
 EOF
 }
 
@@ -175,10 +175,16 @@ build_template() {
             || warn "libguestfs-tools missing — qga + predictable-names won't be auto-configured"
     fi
     if command -v virt-customize >/dev/null; then
+        # We MUST clean cloud-init state + the netplan file that libguestfs
+        # generates during customization — otherwise it bakes in the staging
+        # VM's MAC and every clone will mismatch.
         virt-customize -a "$STAGED_IMG" \
             --run-command 'sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"net.ifnames=0 biosdevname=0 |" /etc/default/grub' \
             --run-command 'update-grub 2>/dev/null || true' \
             --run-command 'systemctl enable qemu-guest-agent.service 2>/dev/null || true' \
+            --run-command 'rm -f /etc/netplan/50-cloud-init.yaml /etc/netplan/00-installer-config.yaml 2>/dev/null || true' \
+            --run-command 'rm -rf /var/lib/cloud/* /var/log/cloud-init*.log 2>/dev/null || true' \
+            --run-command 'cloud-init clean --logs --seed 2>/dev/null || true' \
             --truncate /etc/machine-id \
             >/dev/null 2>&1 || warn "virt-customize had warnings (proceeding)"
     fi
