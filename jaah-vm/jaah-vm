@@ -14,7 +14,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.4.4"
+readonly JAAH_VM_VERSION="0.4.5"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -63,7 +63,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.4.4
+VERSION: jaah-vm v0.4.5
 EOF
 }
 
@@ -175,16 +175,33 @@ build_template() {
             || warn "libguestfs-tools missing — qga + predictable-names won't be auto-configured"
     fi
     if command -v virt-customize >/dev/null; then
-        # We MUST clean cloud-init state + the netplan file that libguestfs
-        # generates during customization — otherwise it bakes in the staging
-        # VM's MAC and every clone will mismatch.
+        # Bake into the template image so first-boot Just Works:
+        #   1. Install qemu-guest-agent (Ubuntu 26.04 cloud image does NOT ship it)
+        #      and enable it via systemd.
+        #   2. Force classic eth0 naming via kernel cmdline.
+        #   3. Drop a default netplan that DHCPs ANY 'e*' interface — works
+        #      regardless of cloud-init / MAC / predictable-names timing.
+        #   4. Wipe cloud-init state so each clone starts fresh (new instance-id,
+        #      regenerated SSH host keys, etc.).
         virt-customize -a "$STAGED_IMG" \
+            --install qemu-guest-agent \
+            --run-command 'systemctl enable qemu-guest-agent.service 2>/dev/null || true' \
             --run-command 'sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=\"|GRUB_CMDLINE_LINUX_DEFAULT=\"net.ifnames=0 biosdevname=0 |" /etc/default/grub' \
             --run-command 'update-grub 2>/dev/null || true' \
-            --run-command 'systemctl enable qemu-guest-agent.service 2>/dev/null || true' \
+            --write '/etc/netplan/99-jaah-default.yaml:network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    primary:
+      match:
+        name: "e*"
+      dhcp4: true
+      dhcp4-overrides:
+        use-dns: true
+        use-routes: true' \
+            --run-command 'chmod 600 /etc/netplan/99-jaah-default.yaml 2>/dev/null || true' \
             --run-command 'rm -f /etc/netplan/50-cloud-init.yaml /etc/netplan/00-installer-config.yaml 2>/dev/null || true' \
-            --run-command 'rm -rf /var/lib/cloud/* /var/log/cloud-init*.log 2>/dev/null || true' \
-            --run-command 'cloud-init clean --logs --seed 2>/dev/null || true' \
+            --run-command 'rm -rf /var/lib/cloud/instances/* /var/lib/cloud/data/* /var/lib/cloud/sem/* /var/log/cloud-init*.log 2>/dev/null || true' \
             --truncate /etc/machine-id \
             >/dev/null 2>&1 || warn "virt-customize had warnings (proceeding)"
     fi
