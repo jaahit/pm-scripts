@@ -12,18 +12,28 @@ One tool per folder. Each is self-contained: source, installer, tests, docs.
 
 ## Installing a tool on a cluster node
 
-```bash
-# Authenticate once (uses your GitHub PAT or SSH key):
-gh auth login
+### One-liner (recommended)
 
-# First time:
-sudo git clone git@github.com:jaahit/pm-scripts.git /opt/pm-scripts
+```bash
+# Always-latest from main:
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- jaah-vm
+
+# Pin to a specific version (production):
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- jaah-vm --ref jaah-vm/v0.2.0
+```
+
+[`bootstrap.sh`](bootstrap.sh) is the **only** file in the repo allowed to be piped to bash. It's under 80 lines (auditable in seconds), does NOT fetch remote code at runtime — it `git clone`s the repo into `/opt/pm-scripts` and delegates to the tool's `install.sh`.
+
+### Manual install (when you want to inspect first)
+
+```bash
+sudo git clone https://github.com/jaahit/pm-scripts.git /opt/pm-scripts
+cd /opt/pm-scripts
+git log --oneline                   # audit history before running
+sudo bash jaah-vm/install.sh
 
 # Updates later:
 sudo git -C /opt/pm-scripts pull
-
-# Install a specific tool:
-sudo bash /opt/pm-scripts/<tool-name>/install.sh
 ```
 
 ## Adding a new tool
