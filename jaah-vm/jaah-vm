@@ -2,19 +2,23 @@
 # jaah-vm — Mini AWS-EC2-style VM launcher for the jaah Proxmox cluster.
 #
 # Subcommands:
-#   wizard   — ★ Interactive 5-step VM creation (whiptail TUI)
-#   create   — Non-interactive: launch a new Ubuntu 26.04 cloud-init VM
-#   rerun    — Replay the exact recipe of an existing managed VM
-#   list     — Show all VMs managed by jaah-vm
-#   status   — Show details for one managed VM
-#   shell    — SSH into a managed VM
-#   destroy  — Terminate a managed VM (manifest-verified, typed confirm)
-#   doctor   — Cluster + tool health check
-#   types    — Show instance-type presets
+#   wizard    — ★ Interactive 5-step VM creation (whiptail TUI)
+#   create    — Non-interactive: launch a new Ubuntu 26.04 cloud-init VM
+#   list      — Show all VMs managed by jaah-vm
+#   status    — Show details for one managed VM
+#   shell     — SSH into a managed VM
+#   start     — Start a stopped VM
+#   stop      — Graceful shutdown (--force = hard stop)
+#   restart   — Reboot a running VM
+#   snapshot  — Create a snapshot
+#   rebuild   — Replay the exact recipe that built a VM (works after destroy)
+#   destroy   — Permanently remove (alias: terminate)
+#   doctor    — Cluster + tool health check
+#   types     — Show instance-type presets
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.4.8"
+readonly JAAH_VM_VERSION="0.5.0"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -41,7 +45,7 @@ fi
 
 show_cheatsheet() {
     cat <<'EOF'
-jaah-vm — Mini EC2 Launch Wizard for jaah-cluster
+jaah-vm — Proxmox VM launcher for jaah-cluster
 
 ★ EASIEST — INTERACTIVE WIZARD:
     jaah-vm wizard                                  # 5-step guided creation
@@ -52,10 +56,16 @@ NON-INTERACTIVE / SCRIPTED:
 
 MANAGE:
     jaah-vm list                                    # all managed VMs
-    jaah-vm shell  web-01                           # SSH into a VM
-    jaah-vm status web-01                           # IP + cloud-init + agent state
-    jaah-vm rerun  web-01                           # rebuild from recorded recipe
-    jaah-vm destroy web-01                          # manifest-verified, typed confirm
+    jaah-vm status   web-01                         # IP + cloud-init + agent state
+    jaah-vm shell    web-01                         # SSH into the VM
+
+LIFECYCLE:
+    jaah-vm start    web-01                         # boot stopped VM
+    jaah-vm stop     web-01                         # graceful shutdown (--force = hard)
+    jaah-vm restart  web-01                         # graceful reboot
+    jaah-vm snapshot web-01 [--name <snap>]         # create snapshot
+    jaah-vm rebuild  web-01                         # replay recipe (works after destroy too)
+    jaah-vm destroy  web-01                         # permanent remove (typed confirm)
 
 DISCOVERY:
     jaah-vm types                                   # list instance-type presets
@@ -63,7 +73,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.4.8
+VERSION: jaah-vm v0.5.0
 EOF
 }
 
@@ -973,6 +983,19 @@ _destroy_managed() {
 _do_destroy() {
     local vmid="$1" name="$2"
     log "Destroying VMID=$vmid ($name)"
+
+    # ── Archive recipe to /var/lib/jaah-vm/history/ BEFORE we delete it.
+    # That way `jaah-vm rebuild <name>` can still find it post-destroy.
+    local recipe_src="${JAAH_RECIPES}/${vmid}.cmd"
+    if [ -r "$recipe_src" ]; then
+        install -m 700 -d "${JAAH_STATE}/history"
+        local ts
+        ts=$(date -u +%Y%m%dT%H%M%SZ)
+        # Tag-safe filename: <ts>-<vmid>-<name>.cmd
+        local archive="${JAAH_STATE}/history/${ts}-${vmid}-${name}.cmd"
+        install -m 600 "$recipe_src" "$archive"
+    fi
+
     qm stop "$vmid" --skiplock --timeout 30 &>/dev/null || true
     sleep 1
     qm destroy "$vmid" --purge 1 --destroy-unreferenced-disks 1 --skiplock
@@ -984,26 +1007,46 @@ _do_destroy() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
-# `rerun`
+# `rebuild` (was `rerun` until v0.4.x) — replay the exact recipe.
+# Works on a still-managed VM (--replace must be in the original recipe) OR
+# on a destroyed VM whose recipe lives in history/.
 # ────────────────────────────────────────────────────────────────────────────
 
-cmd_rerun() {
+cmd_rebuild() {
     local arg="${1:-}"
-    [ -n "$arg" ] || fail "Usage: jaah-vm rerun <name|vmid>"
+    [ -n "$arg" ] || fail "Usage: jaah-vm rebuild <name|vmid>"
 
     require_root
     ensure_state_dirs
 
+    local cmd_line=""
+    local source="(unknown)"
     local vmid
-    vmid=$(resolve_target "$arg") || fail "VM not found among managed: $arg"
-    local recipe="${JAAH_RECIPES}/${vmid}.cmd"
-    [ -r "$recipe" ] || fail "No recipe recorded for $arg (VMID $vmid)"
 
-    local cmd_line
-    cmd_line=$(cat "$recipe")
+    if vmid=$(resolve_target "$arg" 2>/dev/null) && [ -n "$vmid" ]; then
+        local recipe="${JAAH_RECIPES}/${vmid}.cmd"
+        if [ -r "$recipe" ]; then
+            cmd_line=$(cat "$recipe")
+            source="live recipe (VMID $vmid)"
+        fi
+    fi
+
+    # Fallback: look in history/ — pick the MOST RECENT match by name suffix
+    if [ -z "$cmd_line" ] && [ -d "${JAAH_STATE}/history" ]; then
+        local hist
+        hist=$(ls -t "${JAAH_STATE}/history"/*"-${arg}.cmd" 2>/dev/null | head -1)
+        if [ -n "$hist" ]; then
+            cmd_line=$(cat "$hist")
+            source="history $(basename "$hist")"
+        fi
+    fi
+
+    [ -n "$cmd_line" ] || fail "No recipe found for '$arg' (not in live recipes nor history)"
+
     echo "Recorded recipe for $arg:"
+    echo "  Source: $source"
     echo "  $cmd_line"
-    read -r -p "Re-run this command? Type 'yes' to confirm: " typed
+    read -r -p "Rebuild this VM? Type 'yes' to confirm: " typed
     [ "$typed" = "yes" ] || fail "Aborted"
 
     # Re-exec ourselves with the recorded args (after stripping the leading 'jaah-vm create')
@@ -1011,6 +1054,117 @@ cmd_rerun() {
     self=$(readlink -f "$0")
     # shellcheck disable=SC2086
     eval "$self" $(echo "$cmd_line" | sed 's/^jaah-vm //')
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Lifecycle: start / stop / restart / snapshot / terminate
+# ────────────────────────────────────────────────────────────────────────────
+
+_resolve_managed_vmid() {
+    # Helper: name|vmid → vmid, fail if not managed.
+    local arg="$1"
+    local vmid
+    vmid=$(resolve_target "$arg") || fail "VM not found: $arg"
+    is_managed "$vmid" || fail "VMID $vmid is not managed by jaah-vm"
+    printf '%s' "$vmid"
+}
+
+cmd_start() {
+    local arg="${1:-}"
+    [ -n "$arg" ] || fail "Usage: jaah-vm start <name|vmid>"
+    require_root
+    local vmid; vmid=$(_resolve_managed_vmid "$arg")
+    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    [ "$s" = "running" ] && { ok "Already running"; return 0; }
+    log "Starting VMID=$vmid"
+    qm start "$vmid"
+    ok "Started"
+}
+
+cmd_stop() {
+    # Default: graceful ACPI shutdown. --force = hard stop (qm stop).
+    local arg="${1:-}"
+    [ -n "$arg" ] || fail "Usage: jaah-vm stop <name|vmid> [--force]"
+    local mode="graceful"
+    [ "${2:-}" = "--force" ] && mode="force"
+    require_root
+    local vmid; vmid=$(_resolve_managed_vmid "$arg")
+    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    [ "$s" = "stopped" ] && { ok "Already stopped"; return 0; }
+    if [ "$mode" = "force" ]; then
+        log "Force-stopping VMID=$vmid"
+        qm stop "$vmid" --timeout 10
+    else
+        log "Shutting down VMID=$vmid (graceful, 60s timeout)"
+        qm shutdown "$vmid" --timeout 60 --forceStop 0 || \
+            fail "Graceful shutdown failed — try: jaah-vm stop $arg --force"
+    fi
+    ok "Stopped"
+}
+
+cmd_restart() {
+    local arg="${1:-}"
+    [ -n "$arg" ] || fail "Usage: jaah-vm restart <name|vmid>"
+    require_root
+    local vmid; vmid=$(_resolve_managed_vmid "$arg")
+    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    if [ "$s" = "running" ]; then
+        log "Rebooting VMID=$vmid (graceful)"
+        qm reboot "$vmid" --timeout 60
+    else
+        log "VMID=$vmid was stopped — starting"
+        qm start "$vmid"
+    fi
+    ok "Restarted"
+}
+
+cmd_snapshot() {
+    local arg="${1:-}"
+    shift || true
+    [ -n "$arg" ] || fail "Usage: jaah-vm snapshot <name|vmid> [--name <snap>] [--description \"...\"] [--no-vmstate]"
+
+    require_root
+    local vmid; vmid=$(_resolve_managed_vmid "$arg")
+
+    local snap_name="" desc="" with_vmstate="1"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)         snap_name="$2"; shift 2;;
+            --description)  desc="$2"; shift 2;;
+            --no-vmstate)   with_vmstate="0"; shift;;
+            *) fail "Unknown snapshot flag: $1";;
+        esac
+    done
+
+    # Auto-name if not provided: snap-YYYYMMDD-HHMMSS
+    [ -z "$snap_name" ] && snap_name="snap-$(date -u +%Y%m%d-%H%M%S)"
+
+    # Snap name must match qm rules: a-z, A-Z, 0-9, _ (no dashes? actually dashes OK)
+    [[ "$snap_name" =~ ^[A-Za-z][A-Za-z0-9_-]{0,39}$ ]] \
+        || fail "Snapshot name must start with a letter and contain only A-Z a-z 0-9 _ - (max 40)"
+
+    local args=( "$vmid" "$snap_name" )
+    [ -n "$desc" ] && args+=( --description "$desc" )
+    [ "$with_vmstate" = "1" ] && args+=( --vmstate 1 )
+
+    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    if [ "$with_vmstate" = "1" ] && [ "$s" != "running" ]; then
+        warn "VM stopped — taking snapshot without --vmstate (disk-only)"
+        args=( "$vmid" "$snap_name" )
+        [ -n "$desc" ] && args+=( --description "$desc" )
+    fi
+
+    log "Creating snapshot '$snap_name' on VMID=$vmid"
+    qm snapshot "${args[@]}"
+    ok "Snapshot '$snap_name' created"
+    log "  List:   qm listsnapshot $vmid"
+    log "  Roll:   qm rollback $vmid $snap_name"
+    log "  Delete: qm delsnapshot $vmid $snap_name"
+}
+
+# Alias for destroy (AWS-style terminology)
+cmd_terminate() {
+    cmd_destroy "$@"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1209,17 +1363,21 @@ main() {
 
     local sub="$1"; shift
     case "$sub" in
-        create)   cmd_create "$@";;
-        wizard)   cmd_wizard;;
-        rerun)    cmd_rerun "$@";;
-        list)     cmd_list "$@";;
-        status)   cmd_status "$@";;
-        shell)    cmd_shell "$@";;
-        destroy)  cmd_destroy "$@";;
-        doctor)   cmd_doctor "$@";;
-        types)    cmd_types;;
-        --version|-V|version)  cmd_version;;
-        --help|-h|help)        show_cheatsheet;;
+        create)              cmd_create "$@";;
+        wizard)              cmd_wizard;;
+        rebuild|rerun)       cmd_rebuild "$@";;   # rerun kept as legacy alias
+        list)                cmd_list "$@";;
+        status)              cmd_status "$@";;
+        shell)               cmd_shell "$@";;
+        start)               cmd_start "$@";;
+        stop)                cmd_stop "$@";;
+        restart|reboot)      cmd_restart "$@";;
+        snapshot|snap)       cmd_snapshot "$@";;
+        destroy|terminate)   cmd_destroy "$@";;
+        doctor)              cmd_doctor "$@";;
+        types)               cmd_types;;
+        --version|-V|version) cmd_version;;
+        --help|-h|help)       show_cheatsheet;;
         *) fail "Unknown subcommand '$sub'. Run jaah-vm (no args) for the cheat sheet.";;
     esac
 }

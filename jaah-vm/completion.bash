@@ -13,7 +13,7 @@ _jaah_vm() {
         cword=$COMP_CWORD
     fi
 
-    local subcommands="wizard create rerun list status shell destroy doctor types"
+    local subcommands="wizard create list status shell start stop restart snapshot rebuild destroy terminate doctor types"
     local types="tiny small medium large xl 2xl"
     local envs="dev staging prod"
 
@@ -26,7 +26,7 @@ _jaah_vm() {
     local sub="${COMP_WORDS[1]}"
 
     # Subcommands that take a managed VM name or VMID
-    if [[ "$sub" =~ ^(shell|status|destroy|rerun)$ ]] && [ "$cword" -eq 2 ]; then
+    if [[ "$sub" =~ ^(shell|status|start|stop|restart|reboot|snapshot|snap|destroy|terminate|rebuild|rerun)$ ]] && [ "$cword" -eq 2 ]; then
         local vms=""
         if command -v jaah-vm >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
             vms=$(jaah-vm list --json 2>/dev/null | jq -r '.[].name' 2>/dev/null)

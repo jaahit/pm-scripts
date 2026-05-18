@@ -8,7 +8,7 @@ One tool per folder. Each is self-contained: source, installer, tests, docs.
 
 | Tool | Purpose | Latest |
 |---|---|---|
-| [`jaah-vm/`](jaah-vm/) | Proxmox VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.4.8`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.4.8/jaah-vm) |
+| [`jaah-vm/`](jaah-vm/) | Proxmox VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.5.0`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.5.0/jaah-vm) |
 
 ---
 
@@ -31,9 +31,19 @@ jaah-vm create --name web-01         # non-interactive, all defaults (small)
 
 ```bash
 jaah-vm list                         # show all managed VMs
-jaah-vm status  web-01               # IP, cloud-init, agent state
-jaah-vm shell   web-01               # SSH into the VM
-jaah-vm destroy web-01               # tag-verified + typed confirm
+jaah-vm status   web-01              # IP, cloud-init, agent state
+jaah-vm shell    web-01              # SSH into the VM
+```
+
+### 4. Lifecycle
+
+```bash
+jaah-vm start    web-01              # boot a stopped VM
+jaah-vm stop     web-01              # graceful shutdown (--force = hard stop)
+jaah-vm restart  web-01              # graceful reboot
+jaah-vm snapshot web-01              # auto-name snap-YYYYMMDD-HHMMSS
+jaah-vm rebuild  web-01              # replay recipe (works after destroy too)
+jaah-vm destroy  web-01              # permanent remove (typed confirm)
 jaah-vm doctor                       # health check (cluster, storage, template)
 ```
 
@@ -87,10 +97,22 @@ jaah-vm create --name web-01 \
     --start --wait-ssh
 ```
 
-### Replay an existing VM exactly
+### Rebuild a VM from its recorded recipe
 
 ```bash
-jaah-vm rerun web-01                 # re-executes the recorded recipe
+jaah-vm rebuild web-01               # re-executes the original create command
+```
+
+Works whether the VM still exists (the recipe must include `--replace`) or is already destroyed — recipes are archived to `/var/lib/jaah-vm/history/` before destroy.
+
+### Take a snapshot before risky changes
+
+```bash
+jaah-vm snapshot web-01 --name pre-upgrade --description "before kernel upgrade"
+# manage from qm:
+#   qm listsnapshot 102
+#   qm rollback   102 pre-upgrade
+#   qm delsnapshot 102 pre-upgrade
 ```
 
 ### Preview without acting
@@ -147,8 +169,12 @@ Override individual fields with `--cores`, `--memory`, `--disk`.
 | `jaah-vm list` | List all managed VMs |
 | `jaah-vm status <name>` | Show details for one VM |
 | `jaah-vm shell <name>` | SSH into a VM |
-| `jaah-vm rerun <name>` | Replay the exact recipe that built a VM |
-| `jaah-vm destroy <name>` | Terminate (typed-name confirmation required) |
+| `jaah-vm start <name>` | Start a stopped VM |
+| `jaah-vm stop <name> [--force]` | Graceful shutdown (or hard stop) |
+| `jaah-vm restart <name>` | Graceful reboot (alias: `reboot`) |
+| `jaah-vm snapshot <name> [--name X] [--description "..."]` | Create snapshot |
+| `jaah-vm rebuild <name>` | Replay the exact recipe that built a VM |
+| `jaah-vm destroy <name>` | Permanently remove (alias: `terminate`) |
 | `jaah-vm types` | Show instance-type presets |
 | `jaah-vm doctor` | Cluster + tool health check |
 | `jaah-vm --version` | Print version + git SHA |
