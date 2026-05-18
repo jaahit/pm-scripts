@@ -18,7 +18,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.5.2"
+readonly JAAH_VM_VERSION="0.5.3"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -73,7 +73,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.5.2
+VERSION: jaah-vm v0.5.3
 EOF
 }
 
@@ -1143,10 +1143,18 @@ cmd_restart() {
     if [ "$rc" -ne 0 ]; then
         warn "Graceful reboot timed out (qga not ready yet?) — falling back to hard reset"
         qm reset "$vmid" --skiplock || fail "Hard reset also failed (qm reset exit $?)"
-        ok "Hard-reset"
-    else
-        ok "Restarted"
     fi
+    # Post-check: PVE's qm reboot doesn't always re-start the VM after shutdown
+    # (depends on Ubuntu's ACPI handling). Wait briefly; start manually if still stopped.
+    local deadline=$(( $(date +%s) + 20 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        s=$(qm status "$vmid" | awk '{print $2}')
+        [ "$s" = "running" ] && { ok "Restarted"; return 0; }
+        sleep 2
+    done
+    warn "VM ended up stopped after reboot — starting it now"
+    qm start "$vmid"
+    ok "Restarted"
 }
 
 cmd_snapshot() {
