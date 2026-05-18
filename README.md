@@ -8,7 +8,7 @@ One tool per folder. Each is self-contained: source, installer, tests, docs.
 
 | Tool | Purpose | Latest |
 |---|---|---|
-| [`jaah-vm/`](jaah-vm/) | Mini AWS-EC2-style VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.3.2`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.3.2/jaah-vm) |
+| [`jaah-vm/`](jaah-vm/) | Mini AWS-EC2-style VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.3.3`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.3.3/jaah-vm) |
 
 ## Installing a tool on a cluster node
 
@@ -19,7 +19,7 @@ One tool per folder. Each is self-contained: source, installer, tests, docs.
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- jaah-vm
 
 # Pin to a specific version (production):
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- jaah-vm --ref jaah-vm/v0.3.2
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- jaah-vm --ref jaah-vm/v0.3.3
 
 # Generate a fresh exportable keypair (private printed once for copy-paste):
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- jaah-vm --generate-fresh-key

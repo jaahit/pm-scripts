@@ -253,10 +253,20 @@ require_quorum() {
     [ "$rc" -eq 0 ] || fail "Cluster not quorate — refusing to operate"
 }
 
-# feature_detect — fail with clear message if a required qm feature is missing.
+# feature_detect — verify PVE version + binary deps.
+# We rely on virtio-scsi-single + iothread (both stable since PVE 5.x), so the
+# PVE >= 8.0 floor is the real check. `qm --help` doesn't always advertise
+# these flags in its short help (PVE 9.x dropped enum lists), so we don't grep.
 feature_detect() {
-    qm create --help 2>&1 | grep -q 'virtio-scsi-single' || fail "PVE too old: virtio-scsi-single unavailable"
-    qm set --help 2>&1 | grep -q 'iothread' || fail "PVE too old: iothread unavailable"
+    local pve_ver pve_major
+    pve_ver=$(pveversion 2>/dev/null | awk -F'[/-]' '/pve-manager/{print $2}' | head -1)
+    if [ -z "$pve_ver" ]; then
+        pve_ver=$(pveversion 2>/dev/null | head -1 | awk -F'/' '{print $2}' | awk -F- '{print $1}')
+    fi
+    pve_major=$(printf '%s' "$pve_ver" | awk -F. '{print $1}')
+    if [ -z "$pve_major" ] || [ "$pve_major" -lt 8 ] 2>/dev/null; then
+        fail "PVE too old: need 8.0+ (detected '$pve_ver')"
+    fi
     command -v openssl >/dev/null || fail "Missing dependency: openssl"
     command -v jq >/dev/null || fail "Missing dependency: jq"
 }
