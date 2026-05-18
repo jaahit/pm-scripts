@@ -2,7 +2,8 @@
 # jaah-vm — Mini AWS-EC2-style VM launcher for the jaah Proxmox cluster.
 #
 # Subcommands:
-#   create   — Launch a new Ubuntu 26.04 cloud-init VM
+#   wizard   — ★ Interactive 5-step VM creation (whiptail TUI)
+#   create   — Non-interactive: launch a new Ubuntu 26.04 cloud-init VM
 #   rerun    — Replay the exact recipe of an existing managed VM
 #   list     — Show all VMs managed by jaah-vm
 #   status   — Show details for one managed VM
@@ -13,7 +14,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.3.3"
+readonly JAAH_VM_VERSION="0.4.0"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -42,13 +43,18 @@ show_cheatsheet() {
     cat <<'EOF'
 jaah-vm — Mini EC2 Launch Wizard for jaah-cluster
 
-QUICK START:
-    jaah-vm create --name web-01                    # default: type=small, dhcp, key-only
+★ EASIEST — INTERACTIVE WIZARD:
+    jaah-vm wizard                                  # 5-step guided creation
+
+NON-INTERACTIVE / SCRIPTED:
+    jaah-vm create --name web-01                    # default: type=small, key-only
     jaah-vm create --name db-01 --type large --start --wait-ssh
-    jaah-vm list                                    # see all managed VMs
-    jaah-vm shell web-01                            # SSH into a VM
+
+MANAGE:
+    jaah-vm list                                    # all managed VMs
+    jaah-vm shell  web-01                           # SSH into a VM
     jaah-vm status web-01                           # IP + cloud-init + agent state
-    jaah-vm rerun web-01                            # rebuild exactly from recorded recipe
+    jaah-vm rerun  web-01                           # rebuild from recorded recipe
     jaah-vm destroy web-01                          # manifest-verified, typed confirm
 
 DISCOVERY:
@@ -57,7 +63,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.3.3
+VERSION: jaah-vm v0.4.0
 EOF
 }
 
@@ -1024,6 +1030,112 @@ cmd_doctor() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
+# `wizard` — interactive multi-step VM creation (whiptail TUI)
+# ────────────────────────────────────────────────────────────────────────────
+
+cmd_wizard() {
+    command -v whiptail >/dev/null || \
+        fail "wizard needs whiptail — apt install whiptail"
+
+    # Don't try to run a TUI if stdin isn't a terminal
+    [ -t 0 ] || fail "wizard requires an interactive terminal (no stdin redirect / pipe)"
+
+    local TITLE="jaah-vm wizard"
+    local NAME TYPE ENV_TAG START_CHOICE PREVIEW
+
+    whiptail --backtitle "$TITLE" --title "Launch Instance" \
+        --yesno "This wizard creates an Ubuntu 26.04 LTS VM on jaah-cluster.\n\nFive quick steps:\n  1. Name\n  2. Instance type\n  3. Environment tag (optional)\n  4. Boot now? (yes/no)\n  5. Review + launch\n\nContinue?" \
+        16 65 || { echo "Cancelled."; exit 0; }
+
+    # ── Step 1/5 — Name ─────────────────────────────────────────────────────
+    while :; do
+        NAME=$(whiptail --backtitle "$TITLE" --title "Step 1/5 — VM Name" \
+            --inputbox "Hostname (lowercase a-z 0-9 -, 1-63 chars):" \
+            10 65 "" 3>&1 1>&2 2>&3) \
+            || { echo "Cancelled."; exit 0; }
+        if [[ "$NAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+            break
+        fi
+        whiptail --backtitle "$TITLE" --title "Invalid name" \
+            --msgbox "Name must be lowercase a-z 0-9 -, 1-63 chars,\nno leading/trailing dash. Try again." 10 60
+    done
+
+    # Pre-check uniqueness early — better UX than failing at the end
+    if existing=$(resolve_target "$NAME" 2>/dev/null) && [ -n "$existing" ]; then
+        whiptail --backtitle "$TITLE" --title "Name in use" \
+            --yesno "A managed VM named '$NAME' already exists (VMID $existing).\n\nReplace it?" 11 60 \
+            || { echo "Cancelled — pick a different name."; exit 0; }
+        REPLACE_ARG="--replace"
+    else
+        REPLACE_ARG=""
+    fi
+
+    # ── Step 2/5 — Instance type ────────────────────────────────────────────
+    TYPE=$(whiptail --backtitle "$TITLE" --title "Step 2/5 — Instance Type" \
+        --radiolist "Choose a preset (SPACE to select, ENTER to confirm):" 17 70 6 \
+        "tiny"   " 1 vCPU /  1 GB /  10 GB"  OFF \
+        "small"  " 2 vCPU /  2 GB /  20 GB"  ON  \
+        "medium" " 2 vCPU /  4 GB /  40 GB"  OFF \
+        "large"  " 4 vCPU /  8 GB /  80 GB"  OFF \
+        "xl"     " 8 vCPU / 16 GB / 160 GB"  OFF \
+        "2xl"    "16 vCPU / 32 GB / 320 GB"  OFF \
+        3>&1 1>&2 2>&3) \
+        || { echo "Cancelled."; exit 0; }
+
+    # ── Step 3/5 — Environment tag ──────────────────────────────────────────
+    ENV_TAG=$(whiptail --backtitle "$TITLE" --title "Step 3/5 — Environment Tag" \
+        --radiolist "Optional environment label (tag only, no other effect):" 14 60 4 \
+        "none"    "no environment tag"    ON  \
+        "dev"     "development"           OFF \
+        "staging" "staging"               OFF \
+        "prod"    "production"            OFF \
+        3>&1 1>&2 2>&3) \
+        || { echo "Cancelled."; exit 0; }
+    [ "$ENV_TAG" = "none" ] && ENV_TAG=""
+
+    # ── Step 4/5 — Start? ───────────────────────────────────────────────────
+    if whiptail --backtitle "$TITLE" --title "Step 4/5 — Boot After Creation" \
+        --yesno "Start the VM immediately and wait for SSH to become reachable?\n\n  Yes → VM boots + we wait up to 180s for SSH\n  No  → VM is created in 'stopped' state (start later)" \
+        13 70; then
+        START_CHOICE="yes"
+    else
+        START_CHOICE="no"
+    fi
+
+    # ── Step 5/5 — Review ───────────────────────────────────────────────────
+    local cores=$(preset_cores "$TYPE")
+    local mem=$(preset_memory "$TYPE")
+    local disk=$(preset_disk "$TYPE")
+    PREVIEW=$(cat <<EOF
+Review and launch:
+
+  Name:     $NAME
+  Type:     $TYPE  (${cores} vCPU / ${mem} MB / ${disk} GB)
+  Env:      ${ENV_TAG:-<none>}
+  Node:     $(hostname -s)
+  Storage:  $DEFAULT_STORAGE
+  CPU:      $DEFAULT_CPU  (migration-safe)
+  Start:    $START_CHOICE
+  Replace:  ${REPLACE_ARG:-no}
+
+Launch this VM?
+EOF
+)
+    whiptail --backtitle "$TITLE" --title "Step 5/5 — Review" \
+        --yesno "$PREVIEW" 22 70 \
+        || { echo "Cancelled at review."; exit 0; }
+
+    # ── Build args and call cmd_create ──────────────────────────────────────
+    clear
+    echo "─── Launching from wizard ───"
+    local args=( --name "$NAME" --type "$TYPE" )
+    [ -n "$ENV_TAG" ] && args+=( --env "$ENV_TAG" )
+    [ "$START_CHOICE" = "yes" ] && args+=( --start --wait-ssh )
+    [ -n "$REPLACE_ARG" ] && args+=( "$REPLACE_ARG" )
+    cmd_create "${args[@]}"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
 # Main dispatch
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -1033,6 +1145,7 @@ main() {
     local sub="$1"; shift
     case "$sub" in
         create)   cmd_create "$@";;
+        wizard)   cmd_wizard;;
         rerun)    cmd_rerun "$@";;
         list)     cmd_list "$@";;
         status)   cmd_status "$@";;

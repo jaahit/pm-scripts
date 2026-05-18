@@ -53,9 +53,9 @@ fi
 # ────────────────────────────────────────────────────────────────────────────
 # Dependencies
 # ────────────────────────────────────────────────────────────────────────────
-log "Installing dependencies (jq, bats, openssl, python3)"
+log "Installing dependencies (jq, bats, openssl, python3, whiptail)"
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    jq bats openssl python3 python3-yaml 2>&1 | tail -3
+    jq bats openssl python3 python3-yaml whiptail 2>&1 | tail -3
 
 # ────────────────────────────────────────────────────────────────────────────
 # Install dispatcher + lib + completion + logrotate

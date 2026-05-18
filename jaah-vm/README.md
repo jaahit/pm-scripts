@@ -2,15 +2,16 @@
 
 A mini local equivalent of the AWS EC2 Launch Instance Wizard for the **jaah Proxmox cluster**. Clones a hardened Ubuntu 26.04 LTS cloud-init template into a new VM in 10-30 seconds.
 
-**Version:** 0.3.3
+**Version:** 0.4.0
 **Status:** Production-ready, NOT yet deployed
 **Scope:** Cluster nodes only (pmx-01, pmx-02, pmx-06)
 
 ## Quick start
 
 ```bash
+jaah-vm wizard                                 # ★ interactive 5-step wizard
 jaah-vm                                        # cheat-sheet
-jaah-vm create --name web-01                   # smallest defaults, SSH-key-only
+jaah-vm create --name web-01                   # non-interactive: SSH-key-only
 jaah-vm create --name db-01 --type large --start --wait-ssh
 jaah-vm list                                   # all managed VMs
 jaah-vm shell web-01                           # ssh in

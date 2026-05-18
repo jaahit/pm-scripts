@@ -13,7 +13,7 @@ _jaah_vm() {
         cword=$COMP_CWORD
     fi
 
-    local subcommands="create rerun list status shell destroy doctor types"
+    local subcommands="wizard create rerun list status shell destroy doctor types"
     local types="tiny small medium large xl 2xl"
     local envs="dev staging prod"
 
