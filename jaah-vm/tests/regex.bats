@@ -6,7 +6,6 @@ setup() {
     export TEST_DIR=$(mktemp -d)
     export JAAH_ETC="$TEST_DIR/etc"
     export JAAH_SECRETS="$JAAH_ETC/vm-secrets.env"
-    export JAAH_HMAC_KEY="$JAAH_ETC/hmac.key"
     export JAAH_KEYS_DIR="$JAAH_ETC/keys"
     export JAAH_LOG="$TEST_DIR/log"
     export JAAH_STATE="$TEST_DIR/state"

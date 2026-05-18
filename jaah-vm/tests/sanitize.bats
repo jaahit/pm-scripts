@@ -7,7 +7,6 @@ setup() {
     export JAAH_LOG=/tmp/jaah-vm-test.log
     export JAAH_ETC=/tmp/jaah-vm-test-etc
     export JAAH_SECRETS=/tmp/jaah-vm-test-etc/vm-secrets.env
-    export JAAH_HMAC_KEY=/tmp/jaah-vm-test-etc/hmac.key
     export JAAH_KEYS_DIR=/tmp/jaah-vm-test-etc/keys
     export JAAH_STATE=/tmp/jaah-vm-test-state
     export JAAH_LOCK=/tmp/jaah-vm-test-lock.d

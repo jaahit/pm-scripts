@@ -7,13 +7,13 @@
 #   list     — Show all VMs managed by jaah-vm
 #   status   — Show details for one managed VM
 #   shell    — SSH into a managed VM
-#   destroy  — Terminate a managed VM (HMAC-verified, typed confirm)
+#   destroy  — Terminate a managed VM (manifest-verified, typed confirm)
 #   doctor   — Cluster + tool health check
 #   types    — Show instance-type presets
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.2.0"
+readonly JAAH_VM_VERSION="0.3.0"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -57,7 +57,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.2.0
+VERSION: jaah-vm v0.3.0
 EOF
 }
 
@@ -201,7 +201,7 @@ VISIBLE OPTIONS (with defaults):
     --wait-ssh                  implies --start; default timeout 180s
     --dry-run                   print the qm commands; no execution; no lock acquired
     --json                      machine-readable output: {vmid,name,ip,ssh,...}
-    --replace                   destroy existing same-name VM first (HMAC + typed confirm)
+    --replace                   destroy existing same-name VM first (manifest + typed confirm)
     --advanced                  show ALL options in --help
 
 EXAMPLES:
@@ -341,7 +341,7 @@ cmd_create() {
     feature_detect
     ensure_state_dirs
 
-    # Pre-flight: secrets, HMAC key, SSH key
+    # Pre-flight: secrets + SSH key
     check_secrets_safe
     local SSHKEY="${JAAH_KEYS_DIR}/default.pub"
     [ -r "$SSHKEY" ] || fail "Default SSH key missing: $SSHKEY"
@@ -384,7 +384,7 @@ cmd_create() {
         return 0
     fi
 
-    # If --replace, destroy old VM first (HMAC verified)
+    # If --replace, destroy old VM first (manifest verified)
     if [ "$REPLACE" = "yes" ] && [ -n "$existing_vmid" ]; then
         _destroy_managed "$existing_vmid" "$NAME" "force"
     fi
@@ -521,7 +521,7 @@ EOF
 )
     qm set "$VMID" --description "$desc" >/dev/null
 
-    # Ownership manifest (HMAC anchor)
+    # Ownership manifest (pmxcfs-replicated)
     write_manifest "$VMID" "$NAME"
 
     # Record recipe for `rerun`
@@ -716,7 +716,7 @@ Would execute (in cluster lock):
   qm set   <next-vmid>    --ipconfig0 ip=$IPCFG
   qm resize <next-vmid>   scsi0 ${DISK_GB}G   (if > 20)
   qm set   <next-vmid>    --tags managed-by-jaah-vm,jaah,...
-  write_manifest /etc/pve/jaah-vm/<next-vmid>.json (HMAC-signed)
+  write_manifest /etc/pve/jaah-vm/<next-vmid>.json
 
 EOF
 }
@@ -963,15 +963,6 @@ cmd_doctor() {
                               || echo "  [✗] Secrets file mode bad ($JAAH_SECRETS = $s, want root:600)"
     else
         echo "  [✗] Secrets file missing: $JAAH_SECRETS"
-    fi
-
-    # HMAC key
-    if [ -r "$JAAH_HMAC_KEY" ]; then
-        local s; s=$(stat -c '%U:%a' "$JAAH_HMAC_KEY")
-        [ "$s" = "root:600" ] && echo "  [✓] HMAC key OK" \
-                              || echo "  [✗] HMAC key perms bad ($s)"
-    else
-        echo "  [✗] HMAC key missing: $JAAH_HMAC_KEY"
     fi
 
     # SSH key

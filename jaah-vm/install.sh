@@ -93,30 +93,6 @@ else
     ok "Secrets file already present"
 fi
 
-# HMAC key — generate if missing, KEEP if exists (must match other nodes)
-if [ ! -f /etc/jaah/hmac.key ]; then
-    warn "HMAC key missing — generating new one (32 random bytes)"
-    warn "If this is NOT the first cluster node, STOP and copy /etc/jaah/hmac.key from another node instead."
-    read -rp "Generate new HMAC key here? Type 'yes' to confirm: " confirm
-    if [ "$confirm" = "yes" ]; then
-        openssl rand 32 > /etc/jaah/hmac.key
-        chmod 600 /etc/jaah/hmac.key
-        chown root:root /etc/jaah/hmac.key
-        ok "Generated /etc/jaah/hmac.key"
-        warn "NOW copy this key to every other cluster node:"
-        warn "  scp /etc/jaah/hmac.key root@pmx-02:/etc/jaah/"
-        warn "  scp /etc/jaah/hmac.key root@pmx-06:/etc/jaah/"
-    else
-        warn "Skipped — install.sh did not generate the HMAC key. Place it manually before using jaah-vm."
-    fi
-else
-    cur=$(stat -c '%U:%a' /etc/jaah/hmac.key)
-    if [ "$cur" != "root:600" ]; then
-        chmod 600 /etc/jaah/hmac.key
-        chown root:root /etc/jaah/hmac.key
-    fi
-    ok "HMAC key already present"
-fi
 
 # ────────────────────────────────────────────────────────────────────────────
 # Final health check

@@ -1,6 +1,6 @@
 # `jaah-vm` — Operator Manual
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Audience:** "I haven't used this in 6 months and need a VM"
 **Cluster scope:** `jaah-cluster` (pmx-01, pmx-02, pmx-06) — standalone nodes are not supported
 
@@ -26,7 +26,7 @@ jaah-vm shell  web-01         # ssh in (multi-stage IP discovery)
 
 # Lifecycle
 jaah-vm rerun   web-01        # rebuild exactly from recorded recipe
-jaah-vm destroy web-01        # tag/HMAC verified, typed confirm
+jaah-vm destroy web-01        # manifest-verified, typed confirm
 ```
 
 ---
@@ -44,25 +44,19 @@ install -d -o root -g root -m 755 /etc/jaah/keys
 install -o root -g root -m 644 ~/.ssh/id_ed25519.pub /etc/jaah/keys/default.pub
 
 # 3. Secrets file (ONLY VM_DEFAULT_PASSWORD matters for now)
-install -o root -g root -m 600 /opt/jaah-vm-repo/vm-secrets.env.example /etc/jaah/vm-secrets.env
+install -o root -g root -m 600 /opt/pm-scripts/jaah-vm/vm-secrets.env.example /etc/jaah/vm-secrets.env
 ${EDITOR:-vim} /etc/jaah/vm-secrets.env      # set VM_DEFAULT_PASSWORD
 
-# 4. HMAC key — same byte sequence across ALL cluster nodes
-openssl rand 32 > /etc/jaah/hmac.key
-chmod 600 /etc/jaah/hmac.key
-# then: scp /etc/jaah/hmac.key pmx-02:/etc/jaah/
-#       scp /etc/jaah/hmac.key pmx-06:/etc/jaah/
-
-# 5. Install the script + lib
+# 4. Install the script + lib
 install -o root -g root -m 755 jaah-vm /usr/local/bin/jaah-vm
 install -d /usr/local/lib/jaah-vm
 install -o root -g root -m 644 lib-common.sh /usr/local/lib/jaah-vm/
 
-# 6. Completion + log rotation
+# 5. Completion + log rotation
 install -o root -g root -m 644 completion.bash /etc/bash_completion.d/jaah-vm
 install -o root -g root -m 644 logrotate.conf  /etc/logrotate.d/jaah-vm
 
-# 7. Verify
+# 6. Verify
 jaah-vm doctor
 ```
 
@@ -72,7 +66,7 @@ Run `jaah-vm doctor` — all checks must be green before first `create`.
 
 ## How the security model works (in one paragraph)
 
-Every VM created by `jaah-vm` carries an **HMAC-signed manifest** at `/etc/pve/jaah-vm/<vmid>.json` (pmxcfs-replicated across cluster). `destroy` refuses unless the manifest exists AND the HMAC verifies — this is the only ownership marker, the `managed-by-jaah-vm` tag is decorative. Even if someone manually tags a random VM with `managed-by-jaah-vm`, the destroy still refuses (no manifest, or manifest tampered). The HMAC key lives at `/etc/jaah/hmac.key` (root:600) and must be identical on every cluster node.
+Every VM created by `jaah-vm` writes an **ownership manifest** at `/etc/pve/jaah-vm/<vmid>.json` (pmxcfs-replicated across cluster). `destroy` refuses unless that file exists with valid JSON shape — this is the only ownership marker, the `managed-by-jaah-vm` tag is decorative. The threat model is single-operator (anyone with root could `qm destroy` directly anyway), so the manifest's job is to prevent accidents: a tag-only check would happily destroy VMs that just happen to share the tag. Manifest existence + typed-name confirmation is enough.
 
 Passwords (when `--set-password` is used) are written into a cloud-init `user-data` file (mode 600) and attached via `qm set --cicustom`. They **never** appear on the `qm` command line and therefore never in `/proc/<pid>/cmdline` or `/var/log/pve/tasks/`.
 
@@ -99,19 +93,19 @@ The launch flow. See `jaah-vm create --help` for the visible flags; `--advanced`
 | `--wait-ssh` | `false` | Block until SSH succeeds (implies `--start`) |
 | `--dry-run` | — | Print plan, no execution, no locks acquired |
 | `--json` | — | Machine-readable output |
-| `--replace` | — | Destroy existing same-name VM first (HMAC-verified) |
+| `--replace` | — | Destroy existing same-name VM first (manifest-verified) |
 
 **Advanced flags** (cores/memory/disk overrides, network, CPU type, VLAN, etc.) — see `jaah-vm create --advanced --help`.
 
 **What happens, step by step:**
 1. Validation (`--name`, `--env`, `--vlan`, etc.)
-2. Pre-flight: cluster quorum, secrets/HMAC perms, SSH key, storage free, ZFS health
+2. Pre-flight: cluster quorum, secrets perms, SSH key, storage free, ZFS health
 3. Template auto-build if missing (one-time, ~30s)
 4. Cluster-wide lock (`mkdir /etc/pve/jaah-vm.lock.d`) — releases on every exit path
 5. VMID allocation (anchored-regex probing — won't collide vm-10 with vm-100)
 6. `qm clone` from VMID 9000 (`ubuntu-26.04-tmpl`)
 7. Apply resources, network, cloud-init (file-based; password never on argv)
-8. Write HMAC manifest at `/etc/pve/jaah-vm/<vmid>.json`
+8. Write manifest at `/etc/pve/jaah-vm/<vmid>.json`
 9. Record recipe at `/var/lib/jaah-vm/recipes/<vmid>.cmd` (used by `rerun`)
 10. Optional `--start` + `--wait-ssh` (multi-stage: agent → ARP → SSH probe)
 
@@ -132,7 +126,7 @@ Recipe lives at `/var/lib/jaah-vm/recipes/<vmid>.cmd` and is also embedded in VM
 
 ### `list`
 
-Shows VMs whose HMAC manifest matches. `--json` for piping.
+Shows VMs whose manifest matches. `--json` for piping.
 
 ```
 VMID    NAME                      STATUS      CREATED
@@ -155,14 +149,13 @@ Specify `--user <name>` to override `ibra`.
 
 ### `destroy <name|vmid> [--force]`
 
-HMAC-verifies ownership; without `--force` asks for typed VM-name confirmation. Cleans up VM, ZFS datasets (anchored-regex, no collisions), recipe file, snippet file, manifest.
+Verifies manifest ownership; without `--force` asks for typed VM-name confirmation. Cleans up VM, ZFS datasets (anchored-regex, no collisions), recipe file, snippet file, manifest.
 
 ### `doctor [--rebuild-template]`
 
 Health checks:
 - Cluster reachable + quorate
 - Secrets file mode + owner (root:600)
-- HMAC key present (root:600)
 - SSH key present
 - Storages active (iso-library, vm-fast)
 - Cloud image present
@@ -179,7 +172,7 @@ Lists the 6 instance-type presets.
 
 ### `--version`
 
-Prints `jaah-vm v0.2.0 (git <sha>)`.
+Prints `jaah-vm v0.3.0 (git <sha>)`.
 
 ---
 
@@ -241,8 +234,8 @@ Another `jaah-vm create` is running somewhere. Wait. Stale lock auto-breaks afte
 ### "Storage 'vm-fast' has N MB free, need M MB"
 Pick `--storage vm-main` or another available pool. Run `pvesm status` to see options.
 
-### "Ownership HMAC mismatch — refusing destructive operation"
-Either the VM was tampered with (description changed), or the HMAC key differs from when it was created (lost the key, replaced it, etc.). Workaround: `qm destroy <vmid>` directly, after manually verifying it's the right VM.
+### "No ownership manifest for VMID N — not managed by jaah-vm"
+The VM has no `/etc/pve/jaah-vm/<vmid>.json` — it wasn't created by jaah-vm. Use `qm destroy <vmid>` directly if you intend to remove it.
 
 ### "VM started but SSH not yet reachable"
 Cloud-init may still be running on first boot. Try:
@@ -262,13 +255,12 @@ Check FortiGate DHCP leases for the VM's MAC. If you set a static IP, verify `qm
 - `/usr/local/bin/jaah-vm` — the dispatcher
 - `/usr/local/lib/jaah-vm/lib-common.sh` — shared functions
 - `/etc/jaah/vm-secrets.env` — `VM_DEFAULT_PASSWORD` (root:600)
-- `/etc/jaah/hmac.key` — 32 random bytes, same across nodes (root:600)
 - `/etc/jaah/keys/default.pub` — operator's SSH public key
 - `/etc/bash_completion.d/jaah-vm` — TAB completion
 - `/etc/logrotate.d/jaah-vm` — weekly rotation, keep 8
 
 **Cluster-wide via pmxcfs (`/etc/pve/`):**
-- `/etc/pve/jaah-vm/<vmid>.json` — ownership manifest, HMAC-signed
+- `/etc/pve/jaah-vm/<vmid>.json` — ownership manifest (pmxcfs-replicated)
 - `/etc/pve/jaah-vm.lock.d/` — cluster-wide mkdir-based lock
 
 **Per-node state:**

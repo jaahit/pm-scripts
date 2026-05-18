@@ -5,7 +5,7 @@
 #   - Strict-mode setup + trap helpers
 #   - Structured logging with sanitization
 #   - Secrets file parsing (parse, never source)
-#   - HMAC-based ownership marker (read/write/verify)
+#   - Ownership manifest (pmxcfs-replicated file existence as marker)
 #   - Cluster-wide locking via pmxcfs atomic-mkdir
 #   - is_managed + verify_ownership
 #   - VMID allocator with anchored regex (no greedy-match data loss)
@@ -26,7 +26,6 @@ set -Eeuo pipefail
 # ────────────────────────────────────────────────────────────────────────────
 JAAH_ETC="${JAAH_ETC:-/etc/jaah}"
 JAAH_SECRETS="${JAAH_SECRETS:-${JAAH_ETC}/vm-secrets.env}"
-JAAH_HMAC_KEY="${JAAH_HMAC_KEY:-${JAAH_ETC}/hmac.key}"
 JAAH_KEYS_DIR="${JAAH_KEYS_DIR:-${JAAH_ETC}/keys}"
 JAAH_LOG="${JAAH_LOG:-/var/log/jaah-vm.log}"
 JAAH_STATE="${JAAH_STATE:-/var/lib/jaah-vm}"
@@ -113,52 +112,33 @@ read_secret() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
-# HMAC-based ownership
+# Ownership marker (manifest file, pmxcfs-replicated)
 # ────────────────────────────────────────────────────────────────────────────
-
-read_hmac_key() {
-    [ -r "$JAAH_HMAC_KEY" ] || fail "HMAC key unreadable: $JAAH_HMAC_KEY"
-    local s
-    s=$(stat -c '%U:%a' "$JAAH_HMAC_KEY" 2>/dev/null) || fail "Cannot stat HMAC key"
-    [ "$s" = "root:600" ] || fail "Bad ownership/perms on $JAAH_HMAC_KEY (got $s, want root:600)"
-    cat "$JAAH_HMAC_KEY"
-}
-
-# compute_hmac <vmid> <name> <created_iso> — emit hex-encoded HMAC-SHA256.
-compute_hmac() {
-    local vmid="$1" name="$2" created="$3"
-    local key
-    key=$(read_hmac_key)
-    printf '%s|%s|%s' "$vmid" "$name" "$created" \
-        | openssl dgst -sha256 -hmac "$key" -hex \
-        | awk '{print $2}'
-}
+# Single-operator cluster: ownership = manifest file existence.
+# Threat model: anyone with root could `qm destroy` directly anyway, so adding
+# crypto signatures would protect against a sceanrio that doesn't exist here.
+# Protection comes from: manifest existence + typed-name confirmation.
 
 # write_manifest <vmid> <name> — atomically create pmxcfs-replicated manifest.
 write_manifest() {
     local vmid="$1" name="$2"
-    local created hmac
+    local created
     created=$(date -u +%FT%TZ)
-    hmac=$(compute_hmac "$vmid" "$name" "$created")
     mkdir -p "$JAAH_MANIFEST_DIR"
     local tmp="${JAAH_MANIFEST_DIR}/.${vmid}.json.tmp"
     cat > "$tmp" <<EOF
-{"vmid":${vmid},"name":"${name}","created":"${created}","hmac":"${hmac}","version":"${JAAH_VM_VERSION:-unknown}"}
+{"vmid":${vmid},"name":"${name}","created":"${created}","version":"${JAAH_VM_VERSION:-unknown}"}
 EOF
     mv -f "$tmp" "${JAAH_MANIFEST_DIR}/${vmid}.json"
 }
 
-# verify_ownership <vmid> — fail unless manifest exists AND HMAC verifies.
+# verify_ownership <vmid> — fail unless manifest exists. Read-and-validate JSON shape.
 verify_ownership() {
     local vmid="$1"
     local manifest="${JAAH_MANIFEST_DIR}/${vmid}.json"
     [ -f "$manifest" ] || fail "No ownership manifest for VMID $vmid — not managed by jaah-vm. Use 'qm destroy' if you own it."
-    local name created stored computed
-    name=$(jq -r '.name' "$manifest" 2>/dev/null)    || fail "Bad manifest JSON: $manifest"
-    created=$(jq -r '.created' "$manifest" 2>/dev/null) || fail "Bad manifest JSON: $manifest"
-    stored=$(jq -r '.hmac' "$manifest" 2>/dev/null)  || fail "Bad manifest JSON: $manifest"
-    computed=$(compute_hmac "$vmid" "$name" "$created")
-    [ "$stored" = "$computed" ] || fail "Ownership HMAC mismatch for VMID $vmid — refusing destructive operation"
+    jq -e '.vmid and .name' "$manifest" >/dev/null 2>&1 \
+        || fail "Bad manifest JSON: $manifest"
 }
 
 # is_managed <vmid> — silent yes/no via exit code (0=managed, 1=not).
@@ -166,12 +146,7 @@ is_managed() {
     local vmid="$1"
     local manifest="${JAAH_MANIFEST_DIR}/${vmid}.json"
     [ -f "$manifest" ] || return 1
-    local name created stored computed
-    name=$(jq -r '.name' "$manifest" 2>/dev/null)    || return 1
-    created=$(jq -r '.created' "$manifest" 2>/dev/null) || return 1
-    stored=$(jq -r '.hmac' "$manifest" 2>/dev/null)  || return 1
-    computed=$(compute_hmac "$vmid" "$name" "$created")
-    [ "$stored" = "$computed" ]
+    jq -e '.vmid and .name' "$manifest" >/dev/null 2>&1
 }
 
 # remove_manifest <vmid> — clean up after destroy.

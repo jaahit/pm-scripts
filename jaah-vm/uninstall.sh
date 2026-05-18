@@ -1,7 +1,7 @@
 #!/bin/bash
 # jaah-vm/uninstall.sh — Cleanly remove jaah-vm from a node.
 #
-# By default, preserves /etc/jaah/ (secrets + HMAC + keys) and
+# By default, preserves /etc/jaah/ (secrets + keys) and
 # /var/lib/jaah-vm/ (recipes) in case you reinstall later.
 # Pass --purge to wipe those too.
 
@@ -25,7 +25,7 @@ rm -f /etc/bash_completion.d/jaah-vm                      && ok "rm /etc/bash_co
 rm -f /etc/logrotate.d/jaah-vm                            && ok "rm /etc/logrotate.d/jaah-vm" || true
 
 if [ "$PURGE" = "yes" ]; then
-    warn "Purging /etc/jaah/ (secrets, HMAC key, SSH key)"
+    warn "Purging /etc/jaah/ (secrets, SSH key)"
     warn "Purging /var/lib/jaah-vm/ (recipes, orphans log)"
     read -rp "Confirm by typing 'PURGE': " confirm
     [ "$confirm" = "PURGE" ] || fail "Aborted"

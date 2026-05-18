@@ -63,5 +63,5 @@ Before merging anything that handles secrets or destructive operations:
 
 1. No `source <user-file>` — parse, don't execute.
 2. No secrets on argv — write to mode-600 file, reference by path.
-3. Destructive operations gated by ownership marker (tag + HMAC manifest, not tag alone).
+3. Destructive operations gated by ownership marker (manifest file existence, not tag alone).
 4. Log lines sanitized — never `set -x` near secrets.
