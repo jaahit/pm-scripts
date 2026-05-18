@@ -14,7 +14,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.4.6"
+readonly JAAH_VM_VERSION="0.4.7"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -63,7 +63,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.4.6
+VERSION: jaah-vm v0.4.7
 EOF
 }
 
@@ -131,20 +131,18 @@ build_template() {
     local force="${1:-no}"
 
     if template_is_valid && [ "$force" != "force" ]; then
-        ok "Template VMID=${TEMPLATE_VMID} (${TEMPLATE_NAME}) already valid — skip build"
-        return 0
+        return 0   # caller decides whether to print anything
     fi
 
     if template_exists; then
-        warn "Template VMID=${TEMPLATE_VMID} exists but invalid (or force) — destroying"
+        substep "destroying old template (invalid or --force)"
         qm destroy "$TEMPLATE_VMID" --purge 1 --destroy-unreferenced-disks 1 --skiplock &>/dev/null || true
     fi
 
     [ -f "$CLOUD_IMG" ] || fail "Cloud image missing: $CLOUD_IMG  (download Ubuntu 26.04 LTS first)"
     storage_active "$TEMPLATE_STORAGE" || fail "Template storage '$TEMPLATE_STORAGE' not active"
 
-    log "Building golden template VMID=${TEMPLATE_VMID} (${TEMPLATE_NAME})"
-
+    substep "creating VM shell (q35 + OVMF + virtio-scsi-single)"
     qm create "$TEMPLATE_VMID" \
         --name "$TEMPLATE_NAME" \
         --memory 2048 \
@@ -160,14 +158,9 @@ build_template() {
         --agent enabled=1,fstrim_cloned_disks=1 \
         --tablet 0 \
         --localtime 0 \
-        --tags "jaah,template"
+        --tags "jaah,template" >/dev/null
 
-    # Pre-customize the cloud image so all clones boot correctly:
-    #   - net.ifnames=0  → NIC is named 'eth0' (PVE writes network-data with
-    #     name: eth0; Ubuntu's predictable-names like enp0s18 break DHCP).
-    #   - qemu-guest-agent enabled  → PVE can query IP / cloud-init state.
-    # Staged in /tmp so we don't mutate the shared iso-library image.
-    log "  + customize image (eth0 + qga)"
+    substep "customizing cloud image (install qga + netplan + eth0)"
     local STAGED_IMG="/tmp/jaah-vm-template-staged.img"
     cp -f "$CLOUD_IMG" "$STAGED_IMG"
     if ! command -v virt-customize >/dev/null; then
@@ -206,30 +199,19 @@ build_template() {
             >/dev/null 2>&1 || warn "virt-customize had warnings (proceeding)"
     fi
 
-    # Import + attach the customized image as scsi0 in one step.
-    # Using --scsi0 ${STORAGE}:0,import-from=<path>... avoids the EFI/cloud-image
-    # disk-number collision that the older `qm importdisk` flow produced on NFS.
-    log "  + import customized image as scsi0"
+    substep "importing image as scsi0 (~3.5 GB transfer)"
     qm set "$TEMPLATE_VMID" \
-        --scsi0 "${TEMPLATE_STORAGE}:0,import-from=${STAGED_IMG},discard=on,ssd=1,iothread=1" >/dev/null
+        --scsi0 "${TEMPLATE_STORAGE}:0,import-from=${STAGED_IMG},discard=on,ssd=1,iothread=1" 2>&1 \
+        | filter_qm_clone
     rm -f "$STAGED_IMG"
 
-    log "  + EFI disk"
+    substep "EFI disk + cloud-init drive + boot order"
     qm set "$TEMPLATE_VMID" --efidisk0 "${TEMPLATE_STORAGE}:1,efitype=4m,pre-enrolled-keys=0" >/dev/null
-
-    log "  + cloud-init drive"
     qm set "$TEMPLATE_VMID" --ide2 "${TEMPLATE_STORAGE}:cloudinit" >/dev/null
-
-    log "  + boot order"
     qm set "$TEMPLATE_VMID" --boot "order=scsi0" >/dev/null
 
-    # Do NOT resize the template here. The cloud image is ~3.5 GB; resizing to
-    # 20 GB would force every full-clone to transfer 20 GB (mostly zeros) over
-    # NFS. Each VM resizes its own disk to the preset target after cloning.
-    log "  + convert to template"
+    substep "converting to template"
     qm template "$TEMPLATE_VMID" >/dev/null
-
-    ok "Template built: VMID=${TEMPLATE_VMID} (${TEMPLATE_NAME})"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -426,8 +408,10 @@ cmd_create() {
         warn "Custom snippet replaces base cloud-init — ensure it includes ssh_authorized_keys or you'll lock yourself out"
     fi
 
-    # Build template lazily on first call
-    template_is_valid || build_template
+    # ─── STAGED OUTPUT BEGINS HERE ─────────────────────────────────────────
+    _STAGE_TOTAL=8
+    stage_start 1 "Pre-flight checks (cluster, storage, secrets)"
+    stage_done
 
     # --dry-run: print plan, exit. NO LOCKS ACQUIRED.
     if [ "$DRY_RUN" = "yes" ]; then
@@ -435,12 +419,23 @@ cmd_create() {
         return 0
     fi
 
+    # Stage 2: Build template (if needed)
+    if template_is_valid; then
+        stage_start 2 "Template ready (ubuntu-26.04-tmpl)"
+        stage_done "skip — already valid"
+    else
+        stage_start 2 "Building template (Ubuntu 26.04 LTS — first run only)"
+        build_template
+        stage_done
+    fi
+
     # If --replace, destroy old VM first (manifest verified)
     if [ "$REPLACE" = "yes" ] && [ -n "$existing_vmid" ]; then
         _destroy_managed "$existing_vmid" "$NAME" "force"
     fi
 
-    # Acquire cluster lock for VMID allocation + clone
+    # Stage 3: Allocate VMID
+    stage_start 3 "Allocating VMID (cluster-wide lock)"
     with_cluster_lock _do_create_locked \
         "$NAME" "$VMID" "$CORES" "$MEMORY" "$DISK_GB" "$STORAGE" "$BRIDGE" "$VLAN" \
         "$IPCFG" "$GW" "$DNS" "$CPU_TYPE" "$ALLOW_HOST_CPU" \
@@ -454,23 +449,28 @@ cmd_create() {
     FINAL_VMID=$(cat "${JAAH_RUN}/last-vmid" 2>/dev/null)
     [ -n "$FINAL_VMID" ] || fail "Internal: VMID not recorded"
 
-    # Optional start + wait
+    # Optional start + wait (stages 6-8 happen here)
     if [ "$START_VM" = "yes" ]; then
-        log "Starting VM $FINAL_VMID"
-        qm start "$FINAL_VMID"
+        stage_start 6 "Starting VM ${FINAL_VMID}"
+        qm start "$FINAL_VMID" >/dev/null
+        stage_done
         if [ "$WAIT_SSH" = "yes" ]; then
+            stage_start 7 "Waiting for IP (qemu-guest-agent + ARP fallback)"
             local IP
             IP=$(_wait_for_ip "$FINAL_VMID" "$SSHTIMEOUT")
             if [ -n "$IP" ]; then
+                stage_done "$IP"
+                stage_start 8 "Waiting for SSH on ${DEFAULT_USER}@${IP}"
                 if _wait_for_ssh "$IP" "$DEFAULT_USER" "$SSHTIMEOUT"; then
-                    _print_launch_summary "$FINAL_VMID" "$NAME" "$TYPE" "$CORES" "$MEMORY" "$DISK_GB" "$IP" "$STORAGE" "$JSON_OUT"
+                    stage_done
                 else
-                    warn "VM started but SSH not yet reachable on $IP — cloud-init may still be running"
+                    progress_clear
+                    printf '      \033[1;33m!\033[0m SSH not yet reachable on %s — cloud-init may still be running\n' "$IP" >&2
                     _show_cloudinit_status "$FINAL_VMID"
-                    _print_launch_summary "$FINAL_VMID" "$NAME" "$TYPE" "$CORES" "$MEMORY" "$DISK_GB" "$IP" "$STORAGE" "$JSON_OUT"
                 fi
+                _print_launch_summary "$FINAL_VMID" "$NAME" "$TYPE" "$CORES" "$MEMORY" "$DISK_GB" "$IP" "$STORAGE" "$JSON_OUT"
             else
-                warn "VM started but no IP detected within ${SSHTIMEOUT}s"
+                stage_done "no IP within ${SSHTIMEOUT}s"
                 _show_cloudinit_status "$FINAL_VMID"
             fi
         else
@@ -509,19 +509,23 @@ _do_create_locked() {
     JAAH_ROLLBACK_NEW="$VMID_WAS_NEW"
     trap '_on_create_err $LINENO "$BASH_COMMAND" $?' ERR
 
-    log "Cloning VMID=$VMID name=$NAME from template ${TEMPLATE_VMID}"
+    stage_done "VMID=$VMID"
 
+    # Stage 4: Clone
+    stage_start 4 "Cloning VMID ${VMID} (${NAME}) from template"
     local clone_args=( "$TEMPLATE_VMID" "$VMID" --name "$NAME" --full true --storage "$STORAGE" )
     [ -n "$TARGET_NODE" ] && clone_args+=( --target "$TARGET_NODE" )
-    qm clone "${clone_args[@]}"
+    qm clone "${clone_args[@]}" 2>&1 | filter_qm_clone
+    stage_done
 
-    log "  + resources: cores=$CORES memory=$MEMORY"
+    # Stage 5: Configure
+    stage_start 5 "Configuring VM (resources, network, cloud-init, tags)"
+    substep "cores=${CORES} memory=${MEMORY} cpu=${CPU_TYPE}"
     qm set "$VMID" --cores "$CORES" --memory "$MEMORY" --cpu "$CPU_TYPE" >/dev/null
 
-    # Network
     local net0="virtio,bridge=$BRIDGE"
     [ -n "$VLAN" ] && net0="${net0},tag=${VLAN}"
-    log "  + network: $net0  ip=$IPCFG"
+    substep "net=${net0}  ip=${IPCFG}"
     qm set "$VMID" --net0 "$net0" >/dev/null
     if [ "$IPCFG" = "dhcp" ]; then
         qm set "$VMID" --ipconfig0 "ip=dhcp" >/dev/null
@@ -530,21 +534,16 @@ _do_create_locked() {
     fi
     qm set "$VMID" --nameserver "$DNS" >/dev/null
 
-    # Always resize the cloned disk to the preset target. Template ships at
-    # its natural cloud-image size (~3.5 GB) so clones transfer faster; the
-    # resize itself is an instant metadata op + filesystem grow on first boot.
-    log "  + resize root to ${DISK_GB}G"
+    substep "resize root to ${DISK_GB} GB"
     qm resize "$VMID" scsi0 "${DISK_GB}G" >/dev/null
 
-    # SSH key
     qm set "$VMID" --sshkeys "$SSHKEY" >/dev/null
 
-    # Cloud-init: snippet OR base (S1: password via cicustom file, NEVER on argv)
     if [ -n "$VALIDATED_SNIPPET" ]; then
-        log "  + custom cloud-init snippet: $VALIDATED_SNIPPET"
+        substep "cloud-init snippet: $(basename "$VALIDATED_SNIPPET")"
         qm set "$VMID" --cicustom "user=${TEMPLATE_STORAGE}:snippets/jaah-vm/$(basename "$VALIDATED_SNIPPET")" >/dev/null
     elif [ "$SET_PASSWORD" = "yes" ]; then
-        log "  + password auth ENABLED (via cicustom file, not argv)"
+        substep "password auth ENABLED via cicustom file"
         _write_password_snippet "$VMID" "$SSHKEY"
     fi
     # Default path: no cicustom; uses template's built-in user-data + the sshkeys we set above.
@@ -587,7 +586,7 @@ EOF
     trap - ERR
     VMID_TO_ROLLBACK=""
 
-    ok "VM $VMID ($NAME) created"
+    stage_done
 }
 
 # ────────────────────────────────────────────────────────────────────────────

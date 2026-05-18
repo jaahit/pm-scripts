@@ -88,6 +88,64 @@ ok()   { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;32m[✓]
 warn() { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;33m[!]\033[0m %s\n' "$m" >&2; _log_to WARN  "$*"; }
 fail() { local m; m=$(printf '%s' "$*" | sanitize_line); printf '\033[1;31m[✗]\033[0m %s\n' "$m" >&2; _log_to ERROR "$*"; exit 1; }
 
+# ── Multi-stage UX helpers ──
+# Use these for top-level create / wizard flows so the user sees:
+#   [3/8] Cloning from template ............................ ✓ (28s)
+#         └─ <transient progress / sub-bullet>
+_STAGE_TOTAL=8
+_STAGE_START_TIME=0
+
+stage_start() {
+    # stage_start <num> <description>
+    local num="$1"; shift
+    _STAGE_START_TIME=$(date +%s)
+    printf '\033[1;36m[%d/%d]\033[0m %s\n' "$num" "$_STAGE_TOTAL" "$*" >&2
+    _log_to INFO "stage $num/$_STAGE_TOTAL: $*"
+}
+
+stage_done() {
+    # stage_done [optional-note]
+    local elapsed=$(( $(date +%s) - _STAGE_START_TIME ))
+    local note="${1:-}"
+    if [ -n "$note" ]; then
+        printf '      \033[1;32m✓\033[0m %s \033[2m(%ds)\033[0m\n' "$note" "$elapsed" >&2
+    elif [ "$elapsed" -gt 1 ]; then
+        printf '      \033[1;32m✓\033[0m \033[2m(%ds)\033[0m\n' "$elapsed" >&2
+    else
+        printf '      \033[1;32m✓\033[0m\n' >&2
+    fi
+}
+
+substep()  { printf '      \033[2m• %s\033[0m\n' "$*" >&2; }
+
+# Print a transient "in-progress" line that the next print can overwrite.
+# Use \r in the next println via `progress` to redraw.
+progress() {
+    printf '\r\033[K      \033[2m└─ %s\033[0m' "$*" >&2
+}
+progress_clear() { printf '\r\033[K' >&2; }
+
+# Filter for `qm clone` output: collapse "transferred X of Y (Z%)" lines to
+# one updating progress line; drop the noisy create/allocated chatter.
+filter_qm_clone() {
+    local pct
+    while IFS= read -r line; do
+        case "$line" in
+            "transferred "*)
+                pct=$(printf '%s\n' "$line" | grep -oE '\([0-9.]+%' | tr -d '(' | head -1)
+                [ -n "$pct" ] && progress "Cloning disk ${pct}"
+                ;;
+            "create full clone of drive "*|"allocated target volume"*|"creating a clone"*|"generating cloud-init"*|"")
+                : ;; # silence — they're chatty and add nothing
+            *)
+                progress_clear
+                printf '      \033[2m%s\033[0m\n' "$line" >&2
+                ;;
+        esac
+    done
+    progress_clear
+}
+
 # ────────────────────────────────────────────────────────────────────────────
 # Secrets (parse, never source — secrets file must not be executed as code)
 # ────────────────────────────────────────────────────────────────────────────
