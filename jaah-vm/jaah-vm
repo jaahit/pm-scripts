@@ -13,7 +13,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.3.0"
+readonly JAAH_VM_VERSION="0.3.1"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -49,7 +49,7 @@ QUICK START:
     jaah-vm shell web-01                            # SSH into a VM
     jaah-vm status web-01                           # IP + cloud-init + agent state
     jaah-vm rerun web-01                            # rebuild exactly from recorded recipe
-    jaah-vm destroy web-01                          # tag-verified, typed confirm
+    jaah-vm destroy web-01                          # manifest-verified, typed confirm
 
 DISCOVERY:
     jaah-vm types                                   # list instance-type presets
@@ -57,7 +57,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.3.0
+VERSION: jaah-vm v0.3.1
 EOF
 }
 

@@ -2,7 +2,7 @@
 
 A mini local equivalent of the AWS EC2 Launch Instance Wizard for the **jaah Proxmox cluster**. Clones a hardened Ubuntu 26.04 LTS cloud-init template into a new VM in 10-30 seconds.
 
-**Version:** 0.3.0
+**Version:** 0.3.1
 **Status:** Production-ready, NOT yet deployed
 **Scope:** Cluster nodes only (pmx-01, pmx-02, pmx-06)
 
@@ -19,19 +19,36 @@ jaah-vm destroy web-01                         # manifest-verified, typed confir
 
 ## Installation
 
+### Default (use existing /root/.ssh/id_rsa.pub)
+
 ```bash
 sudo bash install.sh
 ```
 
-The installer:
+### Generate a fresh, exportable keypair (recommended for cross-device access)
 
-1. Installs dependencies (`jq`, `bats`, `openssl` — `python3` for snippet validation)
+```bash
+sudo bash install.sh --generate-fresh-key
+```
+
+This creates a NEW ed25519 keypair dedicated to VM access:
+- Public key is saved to `/etc/jaah/keys/default.pub`
+- **Private key is printed to stdout ONCE** for you to copy
+- Private key is then shredded — there is no second chance to retrieve it
+- Save it to your laptop/phone/etc. and use from anywhere
+
+Most modern clients (PuTTY 0.75+, WinSCP, VS Code Remote-SSH, MobaXterm) accept the OpenSSH format directly. For older PuTTY needing `.ppk`, run `puttygen <key> -O private -o <key>.ppk`.
+
+### What the installer does
+
+1. Installs dependencies (`jq`, `bats`, `openssl`, `python3-yaml`)
 2. Installs the dispatcher + lib at `/usr/local/bin/jaah-vm` and `/usr/local/lib/jaah-vm/`
 3. Installs bash completion and logrotate config
 4. Bootstraps `/etc/jaah/`:
    - `vm-secrets.env` (mode 600) — opt-in password used only with `--set-password`
-   - `keys/default.pub` — your SSH public key
+   - `keys/default.pub` — your SSH public key (or freshly generated)
 5. Runs `jaah-vm doctor`
+6. Prints a final installation summary
 
 Run `install.sh` independently on each cluster node — no shared state to sync.
 

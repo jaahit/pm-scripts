@@ -14,11 +14,15 @@
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- <tool>
 #
 #   # Pin to a specific version (recommended for production):
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- <tool> --ref jaah-vm/v0.2.0
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- <tool> --ref jaah-vm/v0.3.1
+#
+#   # Pass extra flags to the tool's install.sh:
+#   bash -c "$(curl -fsSL .../bootstrap.sh)" -- jaah-vm --generate-fresh-key
 #
 # EXAMPLES:
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- jaah-vm
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/jaahit/pm-scripts/main/bootstrap.sh)" -- jaah-vm --ref jaah-vm/v0.2.0
+#   bash -c "$(curl -fsSL .../bootstrap.sh)" -- jaah-vm
+#   bash -c "$(curl -fsSL .../bootstrap.sh)" -- jaah-vm --ref jaah-vm/v0.3.1
+#   bash -c "$(curl -fsSL .../bootstrap.sh)" -- jaah-vm --generate-fresh-key
 
 set -Eeuo pipefail
 
@@ -34,16 +38,25 @@ fail() { printf "\033[1;31m[bootstrap]\033[0m %s\n" "$*" >&2; exit 1; }
 # ── Pre-flight ──────────────────────────────────────────────────────────────
 [ "$(id -u)" -eq 0 ] || fail "Run as root (sudo bash -c \"\$(curl ...)\" -- ...)"
 
-# Parse args after the literal -- separator (or all positional args)
+# Parse args. First non-flag positional is the tool name. Everything after is
+# passed verbatim to the tool's install.sh (so e.g. --generate-fresh-key works).
 TOOL=""
 REF=""
+PASS_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --ref)  REF="$2"; shift 2;;
+        --ref)
+            REF="$2"; shift 2;;
         --help|-h)
             sed -n '2,/^set -/p' "$0" | sed 's/^# \{0,1\}//; /^set -/d'
             exit 0;;
-        *)      TOOL="$1"; shift;;
+        *)
+            if [ -z "$TOOL" ]; then
+                TOOL="$1"; shift
+            else
+                PASS_ARGS+=("$1"); shift
+            fi
+            ;;
     esac
 done
 
@@ -83,6 +96,10 @@ TOOL_DIR="$DEST/$TOOL"
 [ -d "$TOOL_DIR" ] || fail "Tool '$TOOL' not found in repo (no directory $TOOL_DIR)"
 [ -x "$TOOL_DIR/install.sh" ] || fail "Tool '$TOOL' has no install.sh"
 
-log "Delegating to $TOOL_DIR/install.sh"
+if [ "${#PASS_ARGS[@]}" -gt 0 ]; then
+    log "Delegating to $TOOL_DIR/install.sh ${PASS_ARGS[*]}"
+else
+    log "Delegating to $TOOL_DIR/install.sh"
+fi
 echo ""
-bash "$TOOL_DIR/install.sh"
+bash "$TOOL_DIR/install.sh" "${PASS_ARGS[@]}"

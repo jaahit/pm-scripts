@@ -1,6 +1,6 @@
 # `jaah-vm` — Operator Manual
 
-**Version:** 0.3.0
+**Version:** 0.3.1
 **Audience:** "I haven't used this in 6 months and need a VM"
 **Cluster scope:** `jaah-cluster` (pmx-01, pmx-02, pmx-06) — standalone nodes are not supported
 
@@ -172,7 +172,7 @@ Lists the 6 instance-type presets.
 
 ### `--version`
 
-Prints `jaah-vm v0.3.0 (git <sha>)`.
+Prints `jaah-vm v0.3.1 (git <sha>)`.
 
 ---
 
