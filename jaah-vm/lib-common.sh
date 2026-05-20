@@ -177,12 +177,19 @@ filter_qm_clone() {
 # the migration-specific status lines so we collapse them into one updating
 # progress line. Keeps any unmatched lines visible (dimmed) for traceability.
 filter_qm_migrate() {
-    local pct
+    local pct mib
     while IFS= read -r line; do
         case "$line" in
             *"transferred "*|"drive-"*":"*"transferred"*)
-                pct=$(printf '%s\n' "$line" | grep -oE '[0-9.]+%' | tail -1)
-                [ -n "$pct" ] && progress "Migrating ${pct}"
+                # Block-job mirror progress is reported as a percentage.
+                # Live VM-state transfer is reported as "transferred N MiB of M GiB".
+                if [[ "$line" == *%* ]]; then
+                    pct=$(printf '%s' "$line" | grep -oE '[0-9.]+%' | tail -1 || true)
+                    [ -n "$pct" ] && progress "Migrating ${pct}"
+                else
+                    mib=$(printf '%s' "$line" | grep -oE 'transferred [0-9.]+ [KMG]iB[^,]*' | head -1 || true)
+                    [ -n "$mib" ] && progress "RAM: ${mib#transferred }"
+                fi
                 ;;
             "task started by HA resource agent"*|"starting migration of VM"*|\
             "migration started"*|"migration finished successfully"*|\

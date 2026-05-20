@@ -20,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.6.5"
+readonly JAAH_VM_VERSION="0.6.6"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
