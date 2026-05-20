@@ -18,7 +18,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.5.4"
+readonly JAAH_VM_VERSION="0.5.5"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -73,7 +73,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.5.4
+VERSION: jaah-vm v0.5.5
 EOF
 }
 
@@ -1300,14 +1300,15 @@ cmd_wizard() {
 
     local TITLE="jaah-vm wizard"
     local NAME TYPE ENV_TAG START_CHOICE PREVIEW
+    local TARGET_NODE="" TARGET_STORAGE=""
 
     whiptail --backtitle "$TITLE" --title "Launch Instance" \
-        --yesno "This wizard creates an Ubuntu 26.04 LTS VM on jaah-cluster.\n\nFive quick steps:\n  1. Name\n  2. Instance type\n  3. Environment tag (optional)\n  4. Boot now? (yes/no)\n  5. Review + launch\n\nContinue?" \
-        16 65 || { echo "Cancelled."; exit 0; }
+        --yesno "This wizard creates an Ubuntu 26.04 LTS VM on jaah-cluster.\n\nSeven quick steps:\n  1. Name\n  2. Instance type\n  3. Target node\n  4. Storage\n  5. Environment tag (optional)\n  6. Boot now? (yes/no)\n  7. Review + launch\n\nContinue?" \
+        18 65 || { echo "Cancelled."; exit 0; }
 
-    # ── Step 1/5 — Name ─────────────────────────────────────────────────────
+    # ── Step 1/7 — Name ─────────────────────────────────────────────────────
     while :; do
-        NAME=$(whiptail --backtitle "$TITLE" --title "Step 1/5 — VM Name" \
+        NAME=$(whiptail --backtitle "$TITLE" --title "Step 1/7 — VM Name" \
             --inputbox "Hostname (lowercase a-z 0-9 -, 1-63 chars):" \
             10 65 "" 3>&1 1>&2 2>&3) \
             || { echo "Cancelled."; exit 0; }
@@ -1328,8 +1329,8 @@ cmd_wizard() {
         REPLACE_ARG=""
     fi
 
-    # ── Step 2/5 — Instance type ────────────────────────────────────────────
-    TYPE=$(whiptail --backtitle "$TITLE" --title "Step 2/5 — Instance Type" \
+    # ── Step 2/7 — Instance type ────────────────────────────────────────────
+    TYPE=$(whiptail --backtitle "$TITLE" --title "Step 2/7 — Instance Type" \
         --radiolist "Choose a preset (or 'custom' to enter your own):" 19 70 7 \
         "tiny"   " 1 vCPU /  1 GB /  10 GB"  OFF \
         "small"  " 2 vCPU /  2 GB /  20 GB"  ON  \
@@ -1371,8 +1372,66 @@ cmd_wizard() {
         done
     fi
 
-    # ── Step 3/5 — Environment tag ──────────────────────────────────────────
-    ENV_TAG=$(whiptail --backtitle "$TITLE" --title "Step 3/5 — Environment Tag" \
+    # ── Step 3/7 — Target node ──────────────────────────────────────────────
+    # Build radiolist of online cluster nodes, marking current host as default.
+    local _local=$(hostname -s)
+    local _node_args=()
+    while IFS= read -r n; do
+        [ -z "$n" ] && continue
+        local lbl="cluster member"
+        [ "$n" = "$_local" ] && lbl="cluster member (this host) ★"
+        local on="OFF"
+        [ "$n" = "$_local" ] && on="ON"
+        _node_args+=( "$n" "$lbl" "$on" )
+    done < <(pvecm nodes 2>/dev/null | awk 'NR>3 {gsub(/\(local\)/,""); print $3}' | sed 's/[[:space:]]//g')
+
+    if [ "${#_node_args[@]}" -eq 0 ]; then
+        # Standalone — only the local host
+        _node_args=( "$_local" "this host (standalone)" "ON" )
+    fi
+
+    TARGET_NODE=$(whiptail --backtitle "$TITLE" --title "Step 3/7 — Target Node" \
+        --radiolist "Where to run the VM:" 14 60 6 \
+        "${_node_args[@]}" \
+        3>&1 1>&2 2>&3) \
+        || { echo "Cancelled."; exit 0; }
+
+    # ── Step 4/7 — Storage ──────────────────────────────────────────────────
+    # Pull storages on the target node that accept disk images.
+    local _stor_args=()
+    local _stor_out
+    if [ "$TARGET_NODE" = "$_local" ]; then
+        _stor_out=$(pvesm status -content images 2>/dev/null | awk 'NR>1 && $3=="active"')
+    else
+        _stor_out=$(ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+            "root@${TARGET_NODE}" 'pvesm status -content images 2>/dev/null | awk "NR>1 && \$3==\"active\""')
+    fi
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local sname stype free_kb free_gb on
+        sname=$(echo "$line" | awk '{print $1}')
+        stype=$(echo "$line" | awk '{print $2}')
+        free_kb=$(echo "$line" | awk '{print $6}')
+        free_gb=$(awk "BEGIN{printf \"%.0f\", $free_kb/1024/1024}")
+        on="OFF"
+        [ "$sname" = "$DEFAULT_STORAGE" ] && on="ON"
+        _stor_args+=( "$sname" "${stype} — ${free_gb} GB free" "$on" )
+    done <<< "$_stor_out"
+
+    if [ "${#_stor_args[@]}" -eq 0 ]; then
+        whiptail --backtitle "$TITLE" --title "No storage" \
+            --msgbox "No active storage on ${TARGET_NODE} accepts disk images.\nCancelling." 9 60
+        exit 1
+    fi
+
+    TARGET_STORAGE=$(whiptail --backtitle "$TITLE" --title "Step 4/7 — Storage" \
+        --radiolist "Where to place the VM's disks (on ${TARGET_NODE}):" 15 70 6 \
+        "${_stor_args[@]}" \
+        3>&1 1>&2 2>&3) \
+        || { echo "Cancelled."; exit 0; }
+
+    # ── Step 5/7 — Environment tag ──────────────────────────────────────────
+    ENV_TAG=$(whiptail --backtitle "$TITLE" --title "Step 5/7 — Environment Tag" \
         --radiolist "Optional environment label (tag only, no other effect):" 14 60 4 \
         "none"    "no environment tag"    ON  \
         "dev"     "development"           OFF \
@@ -1382,8 +1441,8 @@ cmd_wizard() {
         || { echo "Cancelled."; exit 0; }
     [ "$ENV_TAG" = "none" ] && ENV_TAG=""
 
-    # ── Step 4/5 — Start? ───────────────────────────────────────────────────
-    if whiptail --backtitle "$TITLE" --title "Step 4/5 — Boot After Creation" \
+    # ── Step 6/7 — Start? ───────────────────────────────────────────────────
+    if whiptail --backtitle "$TITLE" --title "Step 6/7 — Boot After Creation" \
         --yesno "Start the VM immediately and wait for SSH to become reachable?\n\n  Yes → VM boots + we wait up to 180s for SSH\n  No  → VM is created in 'stopped' state (start later)" \
         13 70; then
         START_CHOICE="yes"
@@ -1391,7 +1450,7 @@ cmd_wizard() {
         START_CHOICE="no"
     fi
 
-    # ── Step 5/5 — Review ───────────────────────────────────────────────────
+    # ── Step 7/7 — Review ───────────────────────────────────────────────────
     local cores mem disk type_label
     if [ "$TYPE" = "custom" ]; then
         cores="$CUSTOM_CORES"
@@ -1409,9 +1468,9 @@ Review and launch:
 
   Name:     $NAME
   Type:     $type_label  (${cores} vCPU / ${mem} MB / ${disk} GB)
+  Node:     $TARGET_NODE
+  Storage:  $TARGET_STORAGE
   Env:      ${ENV_TAG:-<none>}
-  Node:     $(hostname -s)
-  Storage:  $DEFAULT_STORAGE
   CPU:      $DEFAULT_CPU  (migration-safe)
   Start:    $START_CHOICE
   Replace:  ${REPLACE_ARG:-no}
@@ -1419,14 +1478,14 @@ Review and launch:
 Launch this VM?
 EOF
 )
-    whiptail --backtitle "$TITLE" --title "Step 5/5 — Review" \
+    whiptail --backtitle "$TITLE" --title "Step 7/7 — Review" \
         --yesno "$PREVIEW" 22 70 \
         || { echo "Cancelled at review."; exit 0; }
 
     # ── Build args and call cmd_create ──────────────────────────────────────
     clear
     echo "─── Launching from wizard ───"
-    local args=( --name "$NAME" )
+    local args=( --name "$NAME" --node "$TARGET_NODE" --storage "$TARGET_STORAGE" )
     if [ "$TYPE" = "custom" ]; then
         args+=( --cores "$CUSTOM_CORES" --memory "$CUSTOM_MEM" --disk "${CUSTOM_DISK}G" )
     else
