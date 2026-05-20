@@ -20,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.6.1"
+readonly JAAH_VM_VERSION="0.6.2"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -1238,8 +1238,17 @@ cmd_migrate() {
     local vmid
     vmid=$(_resolve_managed_vmid "$arg")
 
-    local me; me=$(hostname -s)
-    [ "$target" = "$me" ] && fail "Already on $target — nothing to do"
+    # Determine the VM's *current* node from pmxcfs (single source of truth),
+    # not the host running the command — they can differ in a cluster.
+    local current_node=""
+    for n in $(pvecm nodes 2>/dev/null | awk 'NR>3 {gsub(/\(local\)/,""); print $3}'); do
+        if [ -f "/etc/pve/nodes/${n}/qemu-server/${vmid}.conf" ]; then
+            current_node="$n"
+            break
+        fi
+    done
+    [ -n "$current_node" ] || fail "Cannot locate VMID $vmid in any cluster node's qemu-server tree"
+    [ "$target" = "$current_node" ] && fail "VM is already on $target — nothing to do"
 
     # Validate target is in the cluster
     pvecm nodes 2>/dev/null \
@@ -1247,6 +1256,8 @@ cmd_migrate() {
         | sed 's/[[:space:]]//g' \
         | grep -qx "$target" \
         || fail "Target '$target' is not a current cluster member (pvecm nodes)"
+
+    local me; me="$current_node"
 
     _STAGE_TOTAL=3
     stage_start 1 "Pre-flight (target=$target, source=$me)"
@@ -1284,7 +1295,16 @@ cmd_migrate() {
     stage_done
 
     stage_start 2 "Migrating VMID=$vmid → $target"
-    qm migrate "${migrate_args[@]}" 2>&1 | filter_qm_migrate
+    # qm migrate must be invoked on the *source* node. If the VM lives on a
+    # different cluster member, ssh through pmxcfs's trusted root@<node>.
+    local local_host; local_host=$(hostname -s)
+    if [ "$current_node" = "$local_host" ]; then
+        qm migrate "${migrate_args[@]}" 2>&1 | filter_qm_migrate
+    else
+        substep "running qm migrate on $current_node (source) via ssh"
+        ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${current_node}" \
+            "qm migrate $(printf '%q ' "${migrate_args[@]}")" 2>&1 | filter_qm_migrate
+    fi
     local rc=${PIPESTATUS[0]}
     [ "$rc" -eq 0 ] || fail "qm migrate exited $rc"
     stage_done
