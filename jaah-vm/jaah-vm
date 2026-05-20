@@ -18,7 +18,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.5.3"
+readonly JAAH_VM_VERSION="0.5.4"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -73,7 +73,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.5.3
+VERSION: jaah-vm v0.5.4
 EOF
 }
 
@@ -1330,15 +1330,46 @@ cmd_wizard() {
 
     # ── Step 2/5 — Instance type ────────────────────────────────────────────
     TYPE=$(whiptail --backtitle "$TITLE" --title "Step 2/5 — Instance Type" \
-        --radiolist "Choose a preset (SPACE to select, ENTER to confirm):" 17 70 6 \
+        --radiolist "Choose a preset (or 'custom' to enter your own):" 19 70 7 \
         "tiny"   " 1 vCPU /  1 GB /  10 GB"  OFF \
         "small"  " 2 vCPU /  2 GB /  20 GB"  ON  \
         "medium" " 2 vCPU /  4 GB /  40 GB"  OFF \
         "large"  " 4 vCPU /  8 GB /  80 GB"  OFF \
         "xl"     " 8 vCPU / 16 GB / 160 GB"  OFF \
         "2xl"    "16 vCPU / 32 GB / 320 GB"  OFF \
+        "custom" " set cores / RAM / disk manually  ★" OFF \
         3>&1 1>&2 2>&3) \
         || { echo "Cancelled."; exit 0; }
+
+    local CUSTOM_CORES="" CUSTOM_MEM="" CUSTOM_DISK=""
+    if [ "$TYPE" = "custom" ]; then
+        while :; do
+            CUSTOM_CORES=$(whiptail --backtitle "$TITLE" --title "Custom — vCPU cores" \
+                --inputbox "Number of CPU cores (1-128):" 9 60 "2" 3>&1 1>&2 2>&3) \
+                || { echo "Cancelled."; exit 0; }
+            [[ "$CUSTOM_CORES" =~ ^[1-9][0-9]?$|^1[0-1][0-9]$|^12[0-8]$ ]] && break
+            whiptail --backtitle "$TITLE" --title "Invalid" --msgbox "Cores must be 1-128." 8 50
+        done
+        while :; do
+            CUSTOM_MEM=$(whiptail --backtitle "$TITLE" --title "Custom — RAM" \
+                --inputbox "RAM in MiB (512-262144).\nExamples: 1024=1GB, 2048=2GB, 4096=4GB, 16384=16GB" \
+                10 60 "2048" 3>&1 1>&2 2>&3) \
+                || { echo "Cancelled."; exit 0; }
+            if [[ "$CUSTOM_MEM" =~ ^[0-9]+$ ]] && [ "$CUSTOM_MEM" -ge 512 ] && [ "$CUSTOM_MEM" -le 262144 ]; then
+                break
+            fi
+            whiptail --backtitle "$TITLE" --title "Invalid" --msgbox "RAM must be 512-262144 MiB." 8 50
+        done
+        while :; do
+            CUSTOM_DISK=$(whiptail --backtitle "$TITLE" --title "Custom — Root disk size" \
+                --inputbox "Disk size in GB (10-2000):" 9 60 "20" 3>&1 1>&2 2>&3) \
+                || { echo "Cancelled."; exit 0; }
+            if [[ "$CUSTOM_DISK" =~ ^[0-9]+$ ]] && [ "$CUSTOM_DISK" -ge 10 ] && [ "$CUSTOM_DISK" -le 2000 ]; then
+                break
+            fi
+            whiptail --backtitle "$TITLE" --title "Invalid" --msgbox "Disk must be 10-2000 GB." 8 50
+        done
+    fi
 
     # ── Step 3/5 — Environment tag ──────────────────────────────────────────
     ENV_TAG=$(whiptail --backtitle "$TITLE" --title "Step 3/5 — Environment Tag" \
@@ -1361,14 +1392,23 @@ cmd_wizard() {
     fi
 
     # ── Step 5/5 — Review ───────────────────────────────────────────────────
-    local cores=$(preset_cores "$TYPE")
-    local mem=$(preset_memory "$TYPE")
-    local disk=$(preset_disk "$TYPE")
+    local cores mem disk type_label
+    if [ "$TYPE" = "custom" ]; then
+        cores="$CUSTOM_CORES"
+        mem="$CUSTOM_MEM"
+        disk="$CUSTOM_DISK"
+        type_label="custom"
+    else
+        cores=$(preset_cores "$TYPE")
+        mem=$(preset_memory "$TYPE")
+        disk=$(preset_disk "$TYPE")
+        type_label="$TYPE"
+    fi
     PREVIEW=$(cat <<EOF
 Review and launch:
 
   Name:     $NAME
-  Type:     $TYPE  (${cores} vCPU / ${mem} MB / ${disk} GB)
+  Type:     $type_label  (${cores} vCPU / ${mem} MB / ${disk} GB)
   Env:      ${ENV_TAG:-<none>}
   Node:     $(hostname -s)
   Storage:  $DEFAULT_STORAGE
@@ -1386,7 +1426,12 @@ EOF
     # ── Build args and call cmd_create ──────────────────────────────────────
     clear
     echo "─── Launching from wizard ───"
-    local args=( --name "$NAME" --type "$TYPE" )
+    local args=( --name "$NAME" )
+    if [ "$TYPE" = "custom" ]; then
+        args+=( --cores "$CUSTOM_CORES" --memory "$CUSTOM_MEM" --disk "${CUSTOM_DISK}G" )
+    else
+        args+=( --type "$TYPE" )
+    fi
     [ -n "$ENV_TAG" ] && args+=( --env "$ENV_TAG" )
     [ "$START_CHOICE" = "yes" ] && args+=( --start --wait-ssh )
     [ -n "$REPLACE_ARG" ] && args+=( "$REPLACE_ARG" )
