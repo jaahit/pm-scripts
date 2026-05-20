@@ -8,7 +8,7 @@ One tool per folder. Each is self-contained: source, installer, tests, docs.
 
 | Tool | Purpose | Latest |
 |---|---|---|
-| [`jaah-vm/`](jaah-vm/) | Proxmox VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.5.3`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.5.3/jaah-vm) |
+| [`jaah-vm/`](jaah-vm/) | Proxmox VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.6.0`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.6.0/jaah-vm) |
 
 ---
 
@@ -33,6 +33,7 @@ jaah-vm create --name web-01         # non-interactive, all defaults (small)
 jaah-vm list                         # show all managed VMs
 jaah-vm status   web-01              # IP, cloud-init, agent state
 jaah-vm shell    web-01              # SSH into the VM
+jaah-vm exec     web-01 -- uname -a  # run a command via qemu-guest-agent (no SSH)
 ```
 
 ### 4. Lifecycle
@@ -42,6 +43,7 @@ jaah-vm start    web-01              # boot a stopped VM
 jaah-vm stop     web-01              # graceful shutdown (--force = hard stop)
 jaah-vm restart  web-01              # graceful reboot
 jaah-vm snapshot web-01              # auto-name snap-YYYYMMDD-HHMMSS
+jaah-vm migrate  web-01 pmx-02       # move to another cluster node (live by default)
 jaah-vm rebuild  web-01              # replay recipe (works after destroy too)
 jaah-vm destroy  web-01              # permanent remove (typed confirm)
 jaah-vm doctor                       # health check (cluster, storage, template)
@@ -115,6 +117,26 @@ jaah-vm snapshot web-01 --name pre-upgrade --description "before kernel upgrade"
 #   qm delsnapshot 102 pre-upgrade
 ```
 
+### Live-migrate a VM to another node
+
+```bash
+jaah-vm migrate web-01 pmx-02                       # live by default
+jaah-vm migrate web-01 pmx-02 --offline             # force offline copy
+jaah-vm migrate web-01 pmx-02 --targetstorage vm-main  # land on a different storage
+```
+
+Per-node ZFS (`vm-fast` on each host is a separate pool) is handled automatically — the wrapper adds `--with-local-disks --targetstorage <same-name>` so you don't have to remember.
+
+### Run a command inside the VM without SSH
+
+```bash
+jaah-vm exec web-01 -- uname -a
+jaah-vm exec web-01 -- cloud-init status            # great for debugging first-boot
+jaah-vm exec web-01 --timeout 120 -- apt-get -y upgrade
+```
+
+Runs as root in the guest via `qemu-guest-agent`. Stdout/stderr/exit-code are surfaced transparently. Useful before SSH is reachable, or for scripted health probes.
+
 ### Preview without acting
 
 ```bash
@@ -169,10 +191,12 @@ Override individual fields with `--cores`, `--memory`, `--disk`.
 | `jaah-vm list` | List all managed VMs |
 | `jaah-vm status <name>` | Show details for one VM |
 | `jaah-vm shell <name>` | SSH into a VM |
+| `jaah-vm exec <name> [--timeout N] -- <cmd>` | Run a command in the VM via qga (no SSH) |
 | `jaah-vm start <name>` | Start a stopped VM |
 | `jaah-vm stop <name> [--force]` | Graceful shutdown (or hard stop) |
 | `jaah-vm restart <name>` | Graceful reboot (alias: `reboot`) |
 | `jaah-vm snapshot <name> [--name X] [--description "..."]` | Create snapshot |
+| `jaah-vm migrate <name> <target> [--offline] [--targetstorage X]` | Move VM to another node |
 | `jaah-vm rebuild <name>` | Replay the exact recipe that built a VM |
 | `jaah-vm destroy <name>` | Permanently remove (alias: `terminate`) |
 | `jaah-vm types` | Show instance-type presets |

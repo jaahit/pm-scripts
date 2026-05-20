@@ -35,6 +35,7 @@ JAAH_RUN="${JAAH_RUN:-/run/jaah-vm}"
 JAAH_LOCK="${JAAH_LOCK:-/etc/pve/jaah-vm.lock.d}"
 JAAH_MANIFEST_DIR="${JAAH_MANIFEST_DIR:-/etc/pve/jaah-vm}"
 JAAH_SNIPPETS_PATH="${JAAH_SNIPPETS_PATH:-/mnt/pve/iso-library/snippets/jaah-vm}"
+JAAH_NAMES_CACHE="${JAAH_NAMES_CACHE:-${JAAH_STATE}/names.cache}"
 
 # Cluster constants — keep aligned with infrastructure
 readonly TEMPLATE_VMID=9000
@@ -172,6 +173,33 @@ filter_qm_clone() {
     progress_clear
 }
 
+# Filter for `qm migrate` output: similar to filter_qm_clone but recognises
+# the migration-specific status lines so we collapse them into one updating
+# progress line. Keeps any unmatched lines visible (dimmed) for traceability.
+filter_qm_migrate() {
+    local pct
+    while IFS= read -r line; do
+        case "$line" in
+            *"transferred "*|"drive-"*":"*"transferred"*)
+                pct=$(printf '%s\n' "$line" | grep -oE '[0-9.]+%' | tail -1)
+                [ -n "$pct" ] && progress "Migrating ${pct}"
+                ;;
+            "task started by HA resource agent"*|"starting migration of VM"*|\
+            "migration started"*|"migration finished successfully"*|\
+            "migration: type=secure"*|"copying local disk images"*|\
+            "found local disk"*|"all 'mirror' jobs are ready"*|\
+            "all running jobs are ready"*|"")
+                : ;; # silence — chatty boilerplate
+            *)
+                _stage_break
+                progress_clear
+                printf '      \033[2m%s\033[0m\n' "$line" >&2
+                ;;
+        esac
+    done
+    progress_clear
+}
+
 # ────────────────────────────────────────────────────────────────────────────
 # Secrets (parse, never source — secrets file must not be executed as code)
 # ────────────────────────────────────────────────────────────────────────────
@@ -238,6 +266,25 @@ is_managed() {
 # remove_manifest <vmid> — clean up after destroy.
 remove_manifest() {
     rm -f "${JAAH_MANIFEST_DIR}/${1}.json"
+}
+
+# refresh_name_cache — rebuild /var/lib/jaah-vm/names.cache from manifest dir.
+# World-readable cache used by bash-completion (which may run as non-root or
+# even before jaah-vm is fully installed). One name per line.
+# Cheap: O(N) jq calls where N is small (managed VM count).
+refresh_name_cache() {
+    [ -d "$JAAH_STATE" ] || install -m 700 -d "$JAAH_STATE" 2>/dev/null || return 0
+    local tmp="${JAAH_NAMES_CACHE}.tmp.$$"
+    : > "$tmp"
+    if [ -d "$JAAH_MANIFEST_DIR" ]; then
+        for f in "$JAAH_MANIFEST_DIR"/*.json; do
+            [ -e "$f" ] || continue
+            jq -r '.name' "$f" 2>/dev/null >> "$tmp"
+        done
+    fi
+    # Atomic publish, then make readable (sub-shells may run as any user)
+    mv -f "$tmp" "$JAAH_NAMES_CACHE" 2>/dev/null || rm -f "$tmp"
+    chmod 644 "$JAAH_NAMES_CACHE" 2>/dev/null || true
 }
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -13,7 +13,7 @@ _jaah_vm() {
         cword=$COMP_CWORD
     fi
 
-    local subcommands="wizard create list status shell start stop restart snapshot rebuild destroy terminate doctor types"
+    local subcommands="wizard create list status shell exec start stop restart snapshot migrate rebuild destroy terminate doctor types"
     local types="tiny small medium large xl 2xl"
     local envs="dev staging prod"
 
@@ -25,14 +25,54 @@ _jaah_vm() {
 
     local sub="${COMP_WORDS[1]}"
 
-    # Subcommands that take a managed VM name or VMID
-    if [[ "$sub" =~ ^(shell|status|start|stop|restart|reboot|snapshot|snap|destroy|terminate|rebuild|rerun)$ ]] && [ "$cword" -eq 2 ]; then
+    # Subcommands that take a managed VM name or VMID (cword 2)
+    if [[ "$sub" =~ ^(shell|status|exec|start|stop|restart|reboot|snapshot|snap|migrate|destroy|terminate|rebuild|rerun)$ ]] && [ "$cword" -eq 2 ]; then
         local vms=""
-        if command -v jaah-vm >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
-            vms=$(jaah-vm list --json 2>/dev/null | jq -r '.[].name' 2>/dev/null)
+        # Tier A: world-readable plain-text cache (works as any user, even
+        # during a jaah-vm upgrade). Refreshed by cmd_create / _do_destroy.
+        if [ -r /var/lib/jaah-vm/names.cache ]; then
+            vms=$(cat /var/lib/jaah-vm/names.cache 2>/dev/null)
+        # Tier B: fallback — read manifests directly via jq.
+        elif [ -d /etc/pve/jaah-vm ] && command -v jq >/dev/null 2>&1; then
+            vms=$(for f in /etc/pve/jaah-vm/*.json; do
+                [ -e "$f" ] && jq -r '.name' "$f" 2>/dev/null
+            done)
         fi
         COMPREPLY=( $(compgen -W "$vms" -- "$cur") )
         return 0
+    fi
+
+    # `migrate` second arg = target node (after the VM name)
+    if [ "$sub" = "migrate" ] && [ "$cword" -eq 3 ]; then
+        local nodes
+        nodes=$(pvecm nodes 2>/dev/null | awk 'NR>3{gsub(/\(local\)/,""); print $3}' | sed 's/[[:space:]]//g')
+        COMPREPLY=( $(compgen -W "$nodes --offline --targetstorage" -- "$cur") )
+        return 0
+    fi
+
+    # `migrate` flag completion (after target node)
+    if [ "$sub" = "migrate" ]; then
+        case "$prev" in
+            --targetstorage)
+                local stos
+                stos=$(pvesm status 2>/dev/null | awk 'NR>1{print $1}')
+                COMPREPLY=( $(compgen -W "$stos" -- "$cur") ); return 0;;
+        esac
+        if [[ "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "--offline --targetstorage" -- "$cur") )
+            return 0
+        fi
+    fi
+
+    # `exec` flag completion (after VM name + --)
+    if [ "$sub" = "exec" ] && [ "$cword" -ge 3 ]; then
+        case "$prev" in
+            --timeout) COMPREPLY=(); return 0;;
+        esac
+        if [ "$cword" -eq 3 ] && [[ "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "-- --timeout" -- "$cur") )
+            return 0
+        fi
     fi
 
     # `create` flag completion

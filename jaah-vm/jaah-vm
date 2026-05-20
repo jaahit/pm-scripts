@@ -2,15 +2,17 @@
 # jaah-vm — Mini AWS-EC2-style VM launcher for the jaah Proxmox cluster.
 #
 # Subcommands:
-#   wizard    — ★ Interactive 5-step VM creation (whiptail TUI)
+#   wizard    — ★ Interactive 7-step VM creation (whiptail TUI)
 #   create    — Non-interactive: launch a new Ubuntu 26.04 cloud-init VM
 #   list      — Show all VMs managed by jaah-vm
 #   status    — Show details for one managed VM
 #   shell     — SSH into a managed VM
+#   exec      — Run a command inside the VM via qemu-guest-agent (no SSH)
 #   start     — Start a stopped VM
 #   stop      — Graceful shutdown (--force = hard stop)
 #   restart   — Reboot a running VM
 #   snapshot  — Create a snapshot
+#   migrate   — Move a VM to another cluster node (handles per-node ZFS)
 #   rebuild   — Replay the exact recipe that built a VM (works after destroy)
 #   destroy   — Permanently remove (alias: terminate)
 #   doctor    — Cluster + tool health check
@@ -18,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.5.5"
+readonly JAAH_VM_VERSION="0.6.0"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -58,12 +60,14 @@ MANAGE:
     jaah-vm list                                    # all managed VMs
     jaah-vm status   web-01                         # IP + cloud-init + agent state
     jaah-vm shell    web-01                         # SSH into the VM
+    jaah-vm exec     web-01 -- uname -a             # run a command via qga (no SSH)
 
 LIFECYCLE:
     jaah-vm start    web-01                         # boot stopped VM
     jaah-vm stop     web-01                         # graceful shutdown (--force = hard)
     jaah-vm restart  web-01                         # graceful reboot
     jaah-vm snapshot web-01 [--name <snap>]         # create snapshot
+    jaah-vm migrate  web-01 pmx-02                  # move to another cluster node
     jaah-vm rebuild  web-01                         # replay recipe (works after destroy too)
     jaah-vm destroy  web-01                         # permanent remove (typed confirm)
 
@@ -73,7 +77,7 @@ DISCOVERY:
     jaah-vm create --help                           # all create options
     jaah-vm create --advanced --help                # advanced flags
 
-VERSION: jaah-vm v0.5.5
+VERSION: jaah-vm v0.6.0
 EOF
 }
 
@@ -609,6 +613,7 @@ EOF
 
     # Ownership manifest (pmxcfs-replicated)
     write_manifest "$VMID" "$NAME"
+    refresh_name_cache   # keep TAB-completion in sync
 
     # Record recipe for `rerun`
     install -m 700 -d "$JAAH_RECIPES"
@@ -1026,6 +1031,7 @@ _do_destroy() {
     rm -f "${JAAH_SNIPPETS_PATH}/${vmid}-user.yaml" 2>/dev/null || true
     rm -f "${JAAH_RECIPES}/${vmid}.cmd" 2>/dev/null || true
     remove_manifest "$vmid"
+    refresh_name_cache   # keep TAB-completion in sync
     ok "Destroyed $vmid ($name)"
 }
 
@@ -1204,6 +1210,166 @@ cmd_snapshot() {
 # Alias for destroy (AWS-style terminology)
 cmd_terminate() {
     cmd_destroy "$@"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `migrate` — qm migrate wrapper with per-node ZFS awareness
+# ────────────────────────────────────────────────────────────────────────────
+cmd_migrate() {
+    local arg="${1:-}" target="${2:-}"
+    [ -n "$arg" ] && [ -n "$target" ] \
+        || fail "Usage: jaah-vm migrate <name|vmid> <target-node> [--offline] [--targetstorage <name>]"
+    shift 2 || true
+
+    local OFFLINE="no" TARGET_STORAGE_OVERRIDE=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --offline)       OFFLINE="yes"; shift;;
+            --targetstorage) TARGET_STORAGE_OVERRIDE="$2"; shift 2;;
+            *) fail "Unknown migrate flag: $1";;
+        esac
+    done
+
+    require_root
+    require_cluster_member
+    require_quorum
+    ensure_state_dirs
+
+    local vmid
+    vmid=$(_resolve_managed_vmid "$arg")
+
+    local me; me=$(hostname -s)
+    [ "$target" = "$me" ] && fail "Already on $target — nothing to do"
+
+    # Validate target is in the cluster
+    pvecm nodes 2>/dev/null \
+        | awk 'NR>3 {gsub(/\(local\)/,""); print $3}' \
+        | sed 's/[[:space:]]//g' \
+        | grep -qx "$target" \
+        || fail "Target '$target' is not a current cluster member (pvecm nodes)"
+
+    _STAGE_TOTAL=3
+    stage_start 1 "Pre-flight (target=$target, source=$me)"
+    # Detect current scsi0 storage to decide --targetstorage strategy
+    local cur_scsi cur_storage cur_stype
+    cur_scsi=$(qm config "$vmid" 2>/dev/null | awk -F': ' '/^scsi0:/ {print $2; exit}')
+    cur_storage=$(printf '%s' "$cur_scsi" | awk -F: '{print $1}')
+    cur_stype=$(storage_type "$cur_storage" 2>/dev/null)
+    [ -n "$cur_storage" ] || fail "Cannot determine scsi0 storage for VMID $vmid"
+
+    local migrate_args=( "$vmid" "$target" )
+    local mode="offline"
+    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    if [ "$s" = "running" ] && [ "$OFFLINE" != "yes" ]; then
+        migrate_args+=( --online )
+        mode="online (live)"
+    fi
+
+    # Per-node storage → need --with-local-disks and same-name targetstorage.
+    case "$cur_stype" in
+        zfspool|lvm|lvmthin|btrfs|dir)
+            local tgts="${TARGET_STORAGE_OVERRIDE:-$cur_storage}"
+            migrate_args+=( --with-local-disks --targetstorage "$tgts" )
+            substep "storage: $cur_storage ($cur_stype) → $tgts on $target"
+            ;;
+        nfs|cifs|cephfs|rbd|glusterfs)
+            substep "storage: $cur_storage ($cur_stype) — shared, no local-disk copy"
+            ;;
+        *)
+            substep "storage: $cur_storage (type=${cur_stype:-unknown}) — assuming per-node"
+            migrate_args+=( --with-local-disks --targetstorage "${TARGET_STORAGE_OVERRIDE:-$cur_storage}" )
+            ;;
+    esac
+    substep "mode: $mode"
+    stage_done
+
+    stage_start 2 "Migrating VMID=$vmid → $target"
+    qm migrate "${migrate_args[@]}" 2>&1 | filter_qm_migrate
+    local rc=${PIPESTATUS[0]}
+    [ "$rc" -eq 0 ] || fail "qm migrate exited $rc"
+    stage_done
+
+    stage_start 3 "Verifying VM on $target"
+    # qm config is cluster-wide via pmxcfs — runs on any node
+    local new_node
+    new_node=$(qm config "$vmid" 2>/dev/null | grep -E '^node:' | awk '{print $2}')
+    # Some PVE versions don't expose node in qm config; fall back to checking
+    # /etc/pve/nodes/<target>/qemu-server/<vmid>.conf existence.
+    if [ -z "$new_node" ]; then
+        if [ -f "/etc/pve/nodes/${target}/qemu-server/${vmid}.conf" ]; then
+            new_node="$target"
+        fi
+    fi
+    if [ "$new_node" = "$target" ]; then
+        stage_done "VM now on $target"
+    else
+        warn "Could not confirm new location via config; check 'qm status $vmid' manually"
+        stage_done
+    fi
+
+    log "Migration done: VMID=$vmid is now on $target"
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# `exec` — run a command inside the VM via QEMU Guest Agent (no SSH)
+# ────────────────────────────────────────────────────────────────────────────
+cmd_exec() {
+    local arg="${1:-}"
+    shift || true
+
+    local TIMEOUT=60
+    # Parse pre-cmd flags (--timeout). Stop on '--' or first positional cmd.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --timeout) TIMEOUT="$2"; shift 2;;
+            --)        shift; break;;
+            --*)       fail "Unknown exec flag: $1  (use: jaah-vm exec <vm> [--timeout N] [--] <cmd> [args])";;
+            *)         break;;
+        esac
+    done
+
+    [ -n "$arg" ] || fail "Usage: jaah-vm exec <name|vmid> [--timeout N] [--] <cmd> [args...]"
+    [ $# -gt 0 ] || fail "No command specified after VM name"
+    [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || fail "--timeout must be a positive integer"
+
+    require_root
+    local vmid; vmid=$(_resolve_managed_vmid "$arg")
+
+    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    [ "$s" = "running" ] || fail "VM not running (status: $s) — start with: jaah-vm start $arg"
+
+    # Probe qga responsiveness quickly so failures are loud
+    if ! qm guest cmd "$vmid" ping &>/dev/null; then
+        fail "qemu-guest-agent not responding inside VM $arg — try 'jaah-vm shell' instead"
+    fi
+
+    # Capture full JSON from qm guest exec
+    local raw rc
+    raw=$(qm guest exec "$vmid" --timeout "$TIMEOUT" -- "$@" 2>&1)
+    rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        # qm itself failed (not the guest command) — surface the raw text
+        printf '%s\n' "$raw" >&2
+        exit "$rc"
+    fi
+
+    # JSON shape from qga:
+    #   { "exited": 1, "exitcode": N, "out-data": "...", "err-data": "..." }
+    # On timeout / still-running: "exited": 0
+    local exited exitcode
+    exited=$(printf '%s' "$raw" | jq -r '.exited // 0' 2>/dev/null)
+    exitcode=$(printf '%s' "$raw" | jq -r '.["exit-code"] // .exitcode // 0' 2>/dev/null)
+
+    # stdout/stderr to the user
+    printf '%s' "$raw" | jq -r '.["out-data"] // empty' 2>/dev/null
+    printf '%s' "$raw" | jq -r '.["err-data"] // empty' 2>/dev/null >&2
+
+    if [ "$exited" != "1" ]; then
+        warn "Command still running after ${TIMEOUT}s — qga timed out"
+        exit 124
+    fi
+    exit "$exitcode"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1512,10 +1678,12 @@ main() {
         list)                cmd_list "$@";;
         status)              cmd_status "$@";;
         shell)               cmd_shell "$@";;
+        exec)                cmd_exec "$@";;
         start)               cmd_start "$@";;
         stop)                cmd_stop "$@";;
         restart|reboot)      cmd_restart "$@";;
         snapshot|snap)       cmd_snapshot "$@";;
+        migrate)             cmd_migrate "$@";;
         destroy|terminate)   cmd_destroy "$@";;
         doctor)              cmd_doctor "$@";;
         types)               cmd_types;;
