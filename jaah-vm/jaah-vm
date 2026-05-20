@@ -20,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.6.0"
+readonly JAAH_VM_VERSION="0.6.1"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -1343,10 +1343,12 @@ cmd_exec() {
         fail "qemu-guest-agent not responding inside VM $arg — try 'jaah-vm shell' instead"
     fi
 
-    # Capture full JSON from qm guest exec
+    # Capture full output from qm guest exec. On timeout qm prints a non-JSON
+    # prefix ("timeout reached, returning pid") followed by `{"pid": N}`, then
+    # still exits 0. Detect that case explicitly before piping to jq.
     local raw rc
-    raw=$(qm guest exec "$vmid" --timeout "$TIMEOUT" -- "$@" 2>&1)
-    rc=$?
+    raw=$(qm guest exec "$vmid" --timeout "$TIMEOUT" -- "$@" 2>&1) || rc=$?
+    rc="${rc:-0}"
 
     if [ "$rc" -ne 0 ]; then
         # qm itself failed (not the guest command) — surface the raw text
@@ -1354,18 +1356,27 @@ cmd_exec() {
         exit "$rc"
     fi
 
+    if printf '%s' "$raw" | grep -q "timeout reached"; then
+        warn "Command still running after ${TIMEOUT}s — qga timed out"
+        exit 124
+    fi
+
+    # Strip any non-JSON prefix: take from the first '{' to end of output.
+    local json
+    json=$(printf '%s' "$raw" | sed -n '/{/,$p')
+    [ -n "$json" ] || json="$raw"
+
     # JSON shape from qga:
-    #   { "exited": 1, "exitcode": N, "out-data": "...", "err-data": "..." }
-    # On timeout / still-running: "exited": 0
+    #   { "exited": 1, "exit-code": N, "out-data": "...", "err-data": "..." }
     local exited exitcode
-    exited=$(printf '%s' "$raw" | jq -r '.exited // 0' 2>/dev/null)
-    exitcode=$(printf '%s' "$raw" | jq -r '.["exit-code"] // .exitcode // 0' 2>/dev/null)
+    exited=$(printf '%s' "$json"  | jq -r '.exited // 0'                  2>/dev/null || echo 0)
+    exitcode=$(printf '%s' "$json" | jq -r '.["exit-code"] // .exitcode // 0' 2>/dev/null || echo 0)
 
     # stdout/stderr to the user
-    printf '%s' "$raw" | jq -r '.["out-data"] // empty' 2>/dev/null
-    printf '%s' "$raw" | jq -r '.["err-data"] // empty' 2>/dev/null >&2
+    printf '%s' "$json" | jq -r '.["out-data"] // empty' 2>/dev/null || true
+    printf '%s' "$json" | jq -r '.["err-data"] // empty' 2>/dev/null >&2 || true
 
-    if [ "$exited" != "1" ]; then
+    if [ "$exited" != "1" ] && [ "$exited" != "true" ]; then
         warn "Command still running after ${TIMEOUT}s — qga timed out"
         exit 124
     fi
