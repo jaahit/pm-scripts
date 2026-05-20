@@ -20,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.6.3"
+readonly JAAH_VM_VERSION="0.6.4"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -1257,7 +1257,7 @@ cmd_migrate() {
         | grep -qx "$target" \
         || fail "Target '$target' is not a current cluster member (pvecm nodes)"
 
-    local me; me="$current_node"
+    local me; me=$(hostname -s)
 
     _STAGE_TOTAL=3
     stage_start 1 "Pre-flight (target=$target, source=$me)"
@@ -1306,8 +1306,7 @@ cmd_migrate() {
     stage_start 2 "Migrating VMID=$vmid → $target"
     # qm migrate must be invoked on the *source* node. If the VM lives on a
     # different cluster member, ssh through pmxcfs's trusted root@<node>.
-    local local_host; local_host=$(hostname -s)
-    if [ "$current_node" = "$local_host" ]; then
+    if [ "$current_node" = "$me" ]; then
         qm migrate "${migrate_args[@]}" 2>&1 | filter_qm_migrate
     else
         substep "running qm migrate on $current_node (source) via ssh"
@@ -1319,20 +1318,12 @@ cmd_migrate() {
     stage_done
 
     stage_start 3 "Verifying VM on $target"
-    # qm config is cluster-wide via pmxcfs — runs on any node
-    local new_node
-    new_node=$(qm config "$vmid" 2>/dev/null | grep -E '^node:' | awk '{print $2}')
-    # Some PVE versions don't expose node in qm config; fall back to checking
-    # /etc/pve/nodes/<target>/qemu-server/<vmid>.conf existence.
-    if [ -z "$new_node" ]; then
-        if [ -f "/etc/pve/nodes/${target}/qemu-server/${vmid}.conf" ]; then
-            new_node="$target"
-        fi
-    fi
-    if [ "$new_node" = "$target" ]; then
+    # pmxcfs is the cluster's authoritative source — VM config files appear
+    # under /etc/pve/nodes/<owner>/qemu-server/<vmid>.conf on every member.
+    if [ -f "/etc/pve/nodes/${target}/qemu-server/${vmid}.conf" ]; then
         stage_done "VM now on $target"
     else
-        warn "Could not confirm new location via config; check 'qm status $vmid' manually"
+        warn "Could not confirm new location via pmxcfs; check 'qm status $vmid' on $target"
         stage_done
     fi
 
