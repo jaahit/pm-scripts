@@ -20,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.6.4"
+readonly JAAH_VM_VERSION="0.6.5"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -1277,7 +1277,10 @@ cmd_migrate() {
     if [ "$current_node" = "$me" ]; then
         s=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
     else
-        s=$(ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${current_node}" \
+        local src_ip_status
+        src_ip_status=$(jq -r ".nodelist[\"${current_node}\"].ip // empty" /etc/pve/.members 2>/dev/null)
+        [ -n "$src_ip_status" ] || fail "Cannot resolve IP for $current_node from /etc/pve/.members"
+        s=$(ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${src_ip_status}" \
             "qm status $vmid" 2>/dev/null | awk '{print $2}')
     fi
     if [ "$s" = "running" ] && [ "$OFFLINE" != "yes" ]; then
@@ -1305,12 +1308,16 @@ cmd_migrate() {
 
     stage_start 2 "Migrating VMID=$vmid → $target"
     # qm migrate must be invoked on the *source* node. If the VM lives on a
-    # different cluster member, ssh through pmxcfs's trusted root@<node>.
+    # different cluster member, ssh through using its pmxcfs-recorded IP
+    # (cluster member names are not necessarily resolvable via /etc/hosts).
     if [ "$current_node" = "$me" ]; then
         qm migrate "${migrate_args[@]}" 2>&1 | filter_qm_migrate
     else
-        substep "running qm migrate on $current_node (source) via ssh"
-        ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${current_node}" \
+        local src_ip
+        src_ip=$(jq -r ".nodelist[\"${current_node}\"].ip // empty" /etc/pve/.members 2>/dev/null)
+        [ -n "$src_ip" ] || fail "Cannot resolve IP for source node $current_node from /etc/pve/.members"
+        substep "running qm migrate on $current_node ($src_ip) via ssh"
+        ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${src_ip}" \
             "qm migrate $(printf '%q ' "${migrate_args[@]}")" 2>&1 | filter_qm_migrate
     fi
     local rc=${PIPESTATUS[0]}
