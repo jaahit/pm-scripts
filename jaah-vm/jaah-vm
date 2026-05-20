@@ -20,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.6.2"
+readonly JAAH_VM_VERSION="0.6.3"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -1261,16 +1261,25 @@ cmd_migrate() {
 
     _STAGE_TOTAL=3
     stage_start 1 "Pre-flight (target=$target, source=$me)"
-    # Detect current scsi0 storage to decide --targetstorage strategy
+    # Read scsi0 storage + run-state directly from pmxcfs — works regardless
+    # of where the VM lives (qm config/status are local-node only).
+    local cfg="/etc/pve/nodes/${current_node}/qemu-server/${vmid}.conf"
+    [ -f "$cfg" ] || fail "Cannot read VM config at $cfg"
     local cur_scsi cur_storage cur_stype
-    cur_scsi=$(qm config "$vmid" 2>/dev/null | awk -F': ' '/^scsi0:/ {print $2; exit}')
+    cur_scsi=$(awk -F': ' '/^scsi0:/ {print $2; exit}' "$cfg")
     cur_storage=$(printf '%s' "$cur_scsi" | awk -F: '{print $1}')
     cur_stype=$(storage_type "$cur_storage" 2>/dev/null)
     [ -n "$cur_storage" ] || fail "Cannot determine scsi0 storage for VMID $vmid"
 
     local migrate_args=( "$vmid" "$target" )
-    local mode="offline"
-    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    local mode="offline" s
+    # qm status only works on source node; ssh through if remote.
+    if [ "$current_node" = "$me" ]; then
+        s=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
+    else
+        s=$(ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${current_node}" \
+            "qm status $vmid" 2>/dev/null | awk '{print $2}')
+    fi
     if [ "$s" = "running" ] && [ "$OFFLINE" != "yes" ]; then
         migrate_args+=( --online )
         mode="online (live)"
