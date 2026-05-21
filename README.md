@@ -8,7 +8,7 @@ One tool per folder. Each is self-contained: source, installer, tests, docs.
 
 | Tool | Purpose | Latest |
 |---|---|---|
-| [`jaah-vm/`](jaah-vm/) | Proxmox VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.6.7`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.6.7/jaah-vm) |
+| [`jaah-vm/`](jaah-vm/) | Proxmox VM launcher for the cluster (Ubuntu 26.04 LTS cloud-init) | [`jaah-vm/v0.6.9`](https://github.com/jaahit/pm-scripts/tree/jaah-vm/v0.6.9/jaah-vm) |
 
 ---
 
