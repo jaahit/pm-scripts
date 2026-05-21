@@ -547,14 +547,30 @@ _do_create_locked() {
     stage_done "VMID=$VMID"
 
     # Stage 4: Clone
-    # qm clone without --target lands the new VM on the *template's* node
-    # (not the creator's node). Default --target to the local host so
-    # create from any cluster member produces a VM owned by that member.
+    # qm clone must run on the template's owner node (PVE local-config
+    # constraint). With per-node storage (e.g. vm-fast as per-node ZFS),
+    # --target requires shared storage and fails ("can't clone to
+    # non-shared storage"). So we clone locally on the template's owner
+    # node — the new VM lands there. If the operator wants the VM on a
+    # different node, Stage 4b migrates it (preserving per-node storage).
     stage_start 4 "Cloning VMID ${VMID} (${NAME}) from template"
+    local template_owner
+    template_owner=$(locate_vmid_node "$TEMPLATE_VMID" 2>/dev/null) || fail "Template VMID $TEMPLATE_VMID not found in cluster"
     local effective_target="${TARGET_NODE:-$(hostname -s)}"
-    local clone_args=( "$TEMPLATE_VMID" "$VMID" --name "$NAME" --full true --storage "$STORAGE" --target "$effective_target" )
-    qm clone "${clone_args[@]}" 2>&1 | filter_qm_clone
+    local clone_args=( clone "$TEMPLATE_VMID" "$VMID" --name "$NAME" --full true --storage "$STORAGE" )
+    qm_on_node "$TEMPLATE_VMID" "${clone_args[@]}" 2>&1 | filter_qm_clone
+    local clone_rc=${PIPESTATUS[0]}
+    [ "$clone_rc" -eq 0 ] || fail "qm clone exited $clone_rc"
     stage_done
+
+    # Stage 4b (optional): migrate to effective_target if it differs from
+    # the template's owner (where the clone landed).
+    if [ "$effective_target" != "$template_owner" ]; then
+        substep "moving from $template_owner → $effective_target (per-node storage)"
+        qm_on_node "$VMID" migrate "$VMID" "$effective_target" --with-local-disks --targetstorage "$STORAGE" 2>&1 | filter_qm_migrate
+        local mig_rc=${PIPESTATUS[0]}
+        [ "$mig_rc" -eq 0 ] || fail "Post-clone migrate to $effective_target exited $mig_rc"
+    fi
 
     # Stage 5: Configure
     stage_start 5 "Configuring VM (resources, network, cloud-init, tags)"
