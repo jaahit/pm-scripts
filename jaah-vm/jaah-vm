@@ -20,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.6.6"
+readonly JAAH_VM_VERSION="0.6.7"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -140,10 +140,16 @@ template_is_valid() {
     qm config "$TEMPLATE_VMID" | grep -qE "^name:\s*${TEMPLATE_NAME}\$" || return 1
     qm config "$TEMPLATE_VMID" | grep -qE '^tags:.*template' || return 1
     # Reject templates from v0.4.5 and earlier (scsi0 was bloated to 20G).
-    # Modern templates keep the natural ~3.5G cloud-image size.
-    local sz
-    sz=$(qm config "$TEMPLATE_VMID" 2>/dev/null | awk '/^scsi0:/' | grep -oE 'size=[0-9]+G' | head -1 | cut -d= -f2 | tr -d G)
-    [ -n "$sz" ] && [ "$sz" -le 5 ] || return 1
+    # Modern templates keep the natural ~3.5G cloud-image size — PVE may
+    # express that as either "size=3584M" or "size=3.5G", so accept both.
+    local sz_raw sz_gb
+    sz_raw=$(qm config "$TEMPLATE_VMID" 2>/dev/null | awk '/^scsi0:/' | grep -oE 'size=[0-9.]+[MG]' | head -1 | cut -d= -f2)
+    case "$sz_raw" in
+        *G) sz_gb="${sz_raw%G}" ;;
+        *M) sz_gb=$(awk -v m="${sz_raw%M}" 'BEGIN {printf "%d", (m+1023)/1024}') ;;
+        *)  sz_gb="" ;;
+    esac
+    [ -n "$sz_gb" ] && [ "$sz_gb" -le 5 ] || return 1
     return 0
 }
 
@@ -593,11 +599,18 @@ _do_create_locked() {
     [ -n "$ENV_TAG" ] && tags="${tags},${ENV_TAG}"
     [ "$CPU_TYPE" = "host" ] && tags="${tags},migration-incompatible"
     if [ -n "$EXTRA_TAGS" ]; then
-        local extra_sanitized
-        extra_sanitized=$(printf '%s' "$EXTRA_TAGS" | tr ',' '\n' | while read -r t; do
-            sanitize_tag "$t"
-        done | tr '\n' ',' | sed 's/,$//')
-        tags="${tags},${extra_sanitized}"
+        local extra_sanitized=""
+        local _IFS_SAVE="$IFS"
+        IFS=','
+        local _t
+        for _t in $EXTRA_TAGS; do
+            [ -n "$_t" ] || continue
+            local _s
+            _s=$(sanitize_tag "$_t")
+            [ -n "$_s" ] && extra_sanitized="${extra_sanitized:+${extra_sanitized},}${_s}"
+        done
+        IFS="$_IFS_SAVE"
+        [ -n "$extra_sanitized" ] && tags="${tags},${extra_sanitized}"
     fi
     qm set "$VMID" --tags "$tags" >/dev/null
 
@@ -1705,10 +1718,40 @@ EOF
 # Main dispatch
 # ────────────────────────────────────────────────────────────────────────────
 
+_show_subcmd_help() {
+    case "$1" in
+        wizard)   echo "Usage: jaah-vm wizard       Interactive 7-step VM-creation TUI (requires a TTY).";;
+        list)     echo "Usage: jaah-vm list         List all VMs managed by jaah-vm (manifest-tracked).";;
+        status)   echo "Usage: jaah-vm status <name|vmid>     Show VM details (cores, ram, ip, tags, recipe).";;
+        shell)    echo "Usage: jaah-vm shell  <name|vmid>     SSH into the VM as the operator user (key auth).";;
+        exec)     echo "Usage: jaah-vm exec   <name|vmid> [--timeout N] [--] <cmd> [args...]   Run a command via qemu-guest-agent (no SSH).";;
+        start)    echo "Usage: jaah-vm start  <name|vmid>     Boot a stopped VM.";;
+        stop)     echo "Usage: jaah-vm stop   <name|vmid> [--force]   Graceful ACPI shutdown (--force = hard stop).";;
+        restart|reboot)
+                  echo "Usage: jaah-vm restart <name|vmid>    Graceful reboot, falls back to hard reset if qga unresponsive.";;
+        snapshot|snap)
+                  echo "Usage: jaah-vm snapshot <name|vmid> [--name N] [--description \"...\"]";;
+        migrate)  echo "Usage: jaah-vm migrate <name|vmid> <target-node> [--offline] [--targetstorage <name>]";;
+        rebuild|rerun)
+                  echo "Usage: jaah-vm rebuild <name|vmid>    Replay the exact recipe that built this VM (works after destroy via /var/lib/jaah-vm/history/).";;
+        destroy|terminate)
+                  echo "Usage: jaah-vm destroy <name|vmid>    Permanently remove the VM (typed-confirm required; recipe archived to history).";;
+        *) return 1;;
+    esac
+    return 0
+}
+
 main() {
     [ $# -eq 0 ] && { show_cheatsheet; exit 0; }
 
     local sub="$1"; shift
+
+    # Per-subcommand --help: print a one-line USAGE and exit 0 without
+    # touching the underlying resource (avoids "VM not found: --help").
+    if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+        _show_subcmd_help "$sub" && exit 0
+    fi
+
     case "$sub" in
         create)              cmd_create "$@";;
         wizard)              cmd_wizard;;

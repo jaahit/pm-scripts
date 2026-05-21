@@ -45,7 +45,7 @@ _jaah_vm() {
     # `migrate` second arg = target node (after the VM name)
     if [ "$sub" = "migrate" ] && [ "$cword" -eq 3 ]; then
         local nodes
-        nodes=$(pvecm nodes 2>/dev/null | awk 'NR>3{gsub(/\(local\)/,""); print $3}' | sed 's/[[:space:]]//g')
+        nodes=$(pvecm nodes 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {gsub(/\(local\)/,""); print $3}' | sed 's/[[:space:]]//g')
         COMPREPLY=( $(compgen -W "$nodes --offline --targetstorage" -- "$cur") )
         return 0
     fi
@@ -84,7 +84,7 @@ _jaah_vm() {
             --cpu)     COMPREPLY=( $(compgen -W "x86-64-v2-AES x86-64-v3 host" -- "$cur") ); return 0;;
             --node)
                 local nodes
-                nodes=$(pvecm nodes 2>/dev/null | awk 'NR>3{print $3}')
+                nodes=$(pvecm nodes 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {gsub(/\(local\)/,""); print $3}')
                 COMPREPLY=( $(compgen -W "$nodes" -- "$cur") ); return 0;;
             --storage)
                 local stos
