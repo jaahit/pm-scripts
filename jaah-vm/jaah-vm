@@ -20,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.6.8"
+readonly JAAH_VM_VERSION="0.6.9"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -547,9 +547,12 @@ _do_create_locked() {
     stage_done "VMID=$VMID"
 
     # Stage 4: Clone
+    # qm clone without --target lands the new VM on the *template's* node
+    # (not the creator's node). Default --target to the local host so
+    # create from any cluster member produces a VM owned by that member.
     stage_start 4 "Cloning VMID ${VMID} (${NAME}) from template"
-    local clone_args=( "$TEMPLATE_VMID" "$VMID" --name "$NAME" --full true --storage "$STORAGE" )
-    [ -n "$TARGET_NODE" ] && clone_args+=( --target "$TARGET_NODE" )
+    local effective_target="${TARGET_NODE:-$(hostname -s)}"
+    local clone_args=( "$TEMPLATE_VMID" "$VMID" --name "$NAME" --full true --storage "$STORAGE" --target "$effective_target" )
     qm clone "${clone_args[@]}" 2>&1 | filter_qm_clone
     stage_done
 
