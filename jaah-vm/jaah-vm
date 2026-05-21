@@ -20,7 +20,7 @@
 #
 # See `jaah-vm --help` and `jaah-vm <subcommand> --help`.
 
-readonly JAAH_VM_VERSION="0.6.7"
+readonly JAAH_VM_VERSION="0.6.8"
 export JAAH_VM_VERSION
 
 # Resolve installed lib path; fall back to repo-local for development.
@@ -131,19 +131,23 @@ cmd_version() {
 # ────────────────────────────────────────────────────────────────────────────
 
 template_exists() {
-    qm config "$TEMPLATE_VMID" &>/dev/null
+    # Look across all cluster members — pmxcfs is the authority.
+    [ -n "$(locate_vmid_node "$TEMPLATE_VMID" 2>/dev/null)" ]
 }
 
 template_is_valid() {
-    template_exists || return 1
-    qm config "$TEMPLATE_VMID" | grep -qE '^template:\s*1' || return 1
-    qm config "$TEMPLATE_VMID" | grep -qE "^name:\s*${TEMPLATE_NAME}\$" || return 1
-    qm config "$TEMPLATE_VMID" | grep -qE '^tags:.*template' || return 1
+    local owner cfg
+    owner=$(locate_vmid_node "$TEMPLATE_VMID" 2>/dev/null) || return 1
+    cfg="/etc/pve/nodes/${owner}/qemu-server/${TEMPLATE_VMID}.conf"
+    [ -f "$cfg" ] || return 1
+    grep -qE '^template:\s*1' "$cfg" || return 1
+    grep -qE "^name:\s*${TEMPLATE_NAME}\$" "$cfg" || return 1
+    grep -qE '^tags:.*template' "$cfg" || return 1
     # Reject templates from v0.4.5 and earlier (scsi0 was bloated to 20G).
     # Modern templates keep the natural ~3.5G cloud-image size — PVE may
     # express that as either "size=3584M" or "size=3.5G", so accept both.
     local sz_raw sz_gb
-    sz_raw=$(qm config "$TEMPLATE_VMID" 2>/dev/null | awk '/^scsi0:/' | grep -oE 'size=[0-9.]+[MG]' | head -1 | cut -d= -f2)
+    sz_raw=$(awk '/^scsi0:/' "$cfg" | grep -oE 'size=[0-9.]+[MG]' | head -1 | cut -d= -f2)
     case "$sz_raw" in
         *G) sz_gb="${sz_raw%G}" ;;
         *M) sz_gb=$(awk -v m="${sz_raw%M}" 'BEGIN {printf "%d", (m+1023)/1024}') ;;
@@ -441,7 +445,7 @@ cmd_create() {
 
     # --dry-run: print plan, exit. NO LOCKS ACQUIRED.
     if [ "$DRY_RUN" = "yes" ]; then
-        _print_plan "$NAME" "$CORES" "$MEMORY" "$DISK_GB" "$STORAGE" "$BRIDGE" "$VLAN" "$IPCFG" "$CPU_TYPE" "$ENV_TAG" "$VALIDATED_SNIPPET"
+        _print_plan "$NAME" "$CORES" "$MEMORY" "$DISK_GB" "$STORAGE" "$BRIDGE" "$VLAN" "$IPCFG" "$CPU_TYPE" "$ENV_TAG" "$VALIDATED_SNIPPET" "${VMID:-}"
         return 0
     fi
 
@@ -499,12 +503,16 @@ cmd_create() {
             else
                 stage_done "no IP within ${SSHTIMEOUT}s"
                 _show_cloudinit_status "$FINAL_VMID"
+                # Still emit machine-readable summary on --json (ip is null).
+                [ "$JSON_OUT" = "yes" ] && _print_launch_summary "$FINAL_VMID" "$NAME" "$TYPE" "$CORES" "$MEMORY" "$DISK_GB" "" "$STORAGE" "$JSON_OUT"
             fi
         else
             ok "VM $FINAL_VMID ($NAME) started (no SSH wait)"
+            [ "$JSON_OUT" = "yes" ] && _print_launch_summary "$FINAL_VMID" "$NAME" "$TYPE" "$CORES" "$MEMORY" "$DISK_GB" "" "$STORAGE" "$JSON_OUT"
         fi
     else
         ok "VM $FINAL_VMID ($NAME) created (not started). Start: qm start $FINAL_VMID"
+        [ "$JSON_OUT" = "yes" ] && _print_launch_summary "$FINAL_VMID" "$NAME" "$TYPE" "$CORES" "$MEMORY" "$DISK_GB" "" "$STORAGE" "$JSON_OUT"
     fi
 }
 
@@ -578,7 +586,21 @@ _do_create_locked() {
     fi
     if [ "$cur_mb" -lt "$target_mb" ]; then
         substep "resize root ${cur_disp} → ${DISK_GB} GB"
-        qm resize "$VMID" scsi0 "${DISK_GB}G" >/dev/null
+        local resize_err
+        resize_err=$(qm resize "$VMID" scsi0 "${DISK_GB}G" 2>&1 >/dev/null) || true
+        # qm resize may exit 0 even when the underlying storage layer (zfs,
+        # lvm-thin) rejects the operation — verify by re-reading config.
+        local new_sz new_mb
+        new_sz=$(qm config "$VMID" 2>/dev/null | awk '/^scsi0:/' | grep -oE 'size=[0-9]+[MG]' | head -1 | cut -d= -f2)
+        case "$new_sz" in
+            *G) new_mb=$(( ${new_sz%G} * 1024 )) ;;
+            *M) new_mb=${new_sz%M} ;;
+            *)  new_mb=0 ;;
+        esac
+        if [ "$new_mb" -lt "$target_mb" ]; then
+            [ -n "$resize_err" ] && printf '      \033[2m%s\033[0m\n' "$resize_err" >&2
+            fail "Disk resize did not take effect (got ${new_sz:-unknown}, wanted ${DISK_GB}G) — check storage capacity / refreservation on ${TEMPLATE_STORAGE}"
+        fi
     else
         substep "disk already ${cur_disp} (preset wants ${DISK_GB} GB, no shrink)"
     fi
@@ -587,7 +609,7 @@ _do_create_locked() {
 
     if [ -n "$VALIDATED_SNIPPET" ]; then
         substep "cloud-init snippet: $(basename "$VALIDATED_SNIPPET")"
-        qm set "$VMID" --cicustom "user=${TEMPLATE_STORAGE}:snippets/jaah-vm/$(basename "$VALIDATED_SNIPPET")" >/dev/null
+        qm set "$VMID" --cicustom "user=${TEMPLATE_STORAGE}:snippets/$(basename "$VALIDATED_SNIPPET")" >/dev/null
     elif [ "$SET_PASSWORD" = "yes" ]; then
         substep "password auth ENABLED via cicustom file"
         _write_password_snippet "$VMID" "$SSHKEY"
@@ -697,13 +719,15 @@ _validate_snippet() {
         fi
     fi
 
-    # Copy to managed location, mode 600, name keyed by sha256
-    install -m 700 -d "$JAAH_SNIPPETS_PATH"
+    # Copy to managed location, mode 600, name keyed by sha256.
+    # PVE storage parser rejects subdirectories under snippets/ so files
+    # must be flat. Distinguish ours via JAAH_SNIPPET_PREFIX.
+    install -m 755 -d "$JAAH_SNIPPETS_PATH"
     local sha base dest
     sha=$(sha256sum "$rp" | awk '{print $1}' | cut -c1-12)
     base=$(basename "$rp" .yaml)
     base=$(sanitize_tag "$base")
-    dest="${JAAH_SNIPPETS_PATH}/$$-${sha}-${base}.yaml"
+    dest="${JAAH_SNIPPETS_PATH}/${JAAH_SNIPPET_PREFIX}$$-${sha}-${base}.yaml"
     install -m 600 "$rp" "$dest"
     printf '%s' "$dest"
 }
@@ -719,10 +743,10 @@ _write_password_snippet() {
     [ -n "$pw" ] || fail "VM_DEFAULT_PASSWORD not set in $JAAH_SECRETS"
 
     install -m 700 -d "$JAAH_RUN"
-    install -m 700 -d "$JAAH_SNIPPETS_PATH"
+    install -m 755 -d "$JAAH_SNIPPETS_PATH"
 
     local tmp="${JAAH_RUN}/${vmid}-user.yaml"
-    local dest="${JAAH_SNIPPETS_PATH}/${vmid}-user.yaml"
+    local dest="${JAAH_SNIPPETS_PATH}/${JAAH_SNIPPET_PREFIX}${vmid}-user.yaml"
 
     # Guard set -x in case it's enabled by caller — never echo pw.
     { set +x; } 2>/dev/null
@@ -743,7 +767,7 @@ _write_password_snippet() {
     chmod 600 "$tmp"
 
     install -m 600 "$tmp" "$dest"
-    qm set "$vmid" --cicustom "user=${TEMPLATE_STORAGE}:snippets/jaah-vm/$(basename "$dest")" >/dev/null
+    qm set "$vmid" --cicustom "user=${TEMPLATE_STORAGE}:snippets/$(basename "$dest")" >/dev/null
 
     shred -u "$tmp" 2>/dev/null || rm -f "$tmp"
 }
@@ -812,10 +836,12 @@ _show_cloudinit_status() {
 # ────────────────────────────────────────────────────────────────────────────
 
 _print_plan() {
-    local NAME="$1" CORES="$2" MEMORY="$3" DISK_GB="$4" STORAGE="$5" BRIDGE="$6" VLAN="$7" IPCFG="$8" CPU="$9" ENV_TAG="${10}" SNIPPET="${11}"
+    local NAME="$1" CORES="$2" MEMORY="$3" DISK_GB="$4" STORAGE="$5" BRIDGE="$6" VLAN="$7" IPCFG="$8" CPU="$9" ENV_TAG="${10}" SNIPPET="${11}" REQ_VMID="${12:-}"
+    local VID="${REQ_VMID:-<next-vmid>}"
     cat <<EOF
 ─── jaah-vm create plan (dry-run, no execution) ───
   name:     $NAME
+  vmid:     ${REQ_VMID:-<auto, next free>}
   type/res: ${CORES} cores  ${MEMORY} MB RAM  ${DISK_GB} GB disk
   cpu:      $CPU
   storage:  $STORAGE
@@ -824,25 +850,28 @@ _print_plan() {
   snippet:  ${SNIPPET:-<base>}
 
 Would execute (in cluster lock):
-  qm clone $TEMPLATE_VMID <next-vmid> --name $NAME --full true --storage $STORAGE
-  qm set   <next-vmid>    --cores $CORES --memory $MEMORY --cpu $CPU
-  qm set   <next-vmid>    --net0 virtio,bridge=$BRIDGE${VLAN:+,tag=$VLAN}
-  qm set   <next-vmid>    --ipconfig0 ip=$IPCFG
-  qm resize <next-vmid>   scsi0 ${DISK_GB}G   (if > 20)
-  qm set   <next-vmid>    --tags managed-by-jaah-vm,jaah,...
-  write_manifest /etc/pve/jaah-vm/<next-vmid>.json
+  qm clone $TEMPLATE_VMID $VID --name $NAME --full true --storage $STORAGE
+  qm set   $VID    --cores $CORES --memory $MEMORY --cpu $CPU
+  qm set   $VID    --net0 virtio,bridge=$BRIDGE${VLAN:+,tag=$VLAN}
+  qm set   $VID    --ipconfig0 ip=$IPCFG
+  qm resize $VID   scsi0 ${DISK_GB}G   (if > template-disk-size)
+  qm set   $VID    --tags managed-by-jaah-vm,jaah,...
+  write_manifest /etc/pve/jaah-vm/${VID}.json
 
 EOF
 }
 
 _print_launch_summary() {
     local vmid="$1" name="$2" type="$3" cores="$4" memory="$5" disk="$6" ip="$7" storage="$8" json_out="$9"
+    local node; node=$(hostname -s)
     if [ "$json_out" = "yes" ]; then
         jq -n \
-            --arg vmid "$vmid" --arg name "$name" --arg ip "$ip" \
-            --arg ssh "ssh ibra@$ip" --arg storage "$storage" \
-            --arg version "$JAAH_VM_VERSION" \
-            '{vmid:($vmid|tonumber), name:$name, ip:$ip, ssh_command:$ssh,
+            --arg vmid "$vmid" --arg name "$name" --arg node "$node" \
+            --arg ip "$ip" --arg ssh "${ip:+ssh ibra@$ip}" \
+            --arg storage "$storage" --arg version "$JAAH_VM_VERSION" \
+            '{vmid:($vmid|tonumber), name:$name, node:$node,
+              ip:($ip|select(length>0)//null),
+              ssh_command:($ssh|select(length>0)//null),
               storage:$storage, managed_by:"jaah-vm", version:$version}'
         return
     fi
@@ -851,12 +880,12 @@ _print_launch_summary() {
   ✓ Instance launched: $name (VMID $vmid)
 ─────────────────────────────────────────────
   Type:     $type (${cores} vCPU / ${memory} MB / ${disk} GB)
-  Node:     $(hostname -s)
-  IP:       $ip
+  Node:     $node
+  IP:       ${ip:-<not yet available>}
   Storage:  $storage
 
   Connect:
-    ssh ibra@$ip
+    ${ip:+ssh ibra@$ip}
     jaah-vm shell $name
 
   Manage:
@@ -882,13 +911,24 @@ cmd_list() {
     for m in "$JAAH_MANIFEST_DIR"/*.json; do
         [ -e "$m" ] || continue
         local vmid name created
-        vmid=$(jq -r '.vmid' "$m" 2>/dev/null)    || continue
-        name=$(jq -r '.name' "$m" 2>/dev/null)    || continue
-        created=$(jq -r '.created' "$m" 2>/dev/null) || continue
-        # Skip if manifest exists but VM gone (orphan manifest)
-        qm config "$vmid" &>/dev/null || continue
+        # Surface bad manifests on stderr so operators notice they exist.
+        if ! vmid=$(jq -r '.vmid' "$m" 2>/dev/null) || [ -z "$vmid" ] || [ "$vmid" = "null" ]; then
+            warn "Skipping unparseable manifest: $(basename "$m") (corrupt JSON?)"
+            continue
+        fi
+        name=$(jq -r '.name' "$m" 2>/dev/null)
+        created=$(jq -r '.created' "$m" 2>/dev/null)
+        # Locate via pmxcfs (cluster-wide), not qm config (local-node only).
+        local owner
+        owner=$(locate_vmid_node "$vmid") || continue
         local status
-        status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
+        if [ "$owner" = "$(hostname -s)" ]; then
+            status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
+        else
+            # Reading qm status across nodes needs ssh-through; for `list`
+            # we keep things fast by reporting the owner node instead.
+            status="@${owner}"
+        fi
         entries+=( "$vmid|$name|$status|$created" )
     done
 
@@ -932,10 +972,16 @@ cmd_status() {
     vmid=$(resolve_target "$arg") || fail "VM not found among managed: $arg"
     is_managed "$vmid" || fail "VMID $vmid is not managed by jaah-vm"
 
-    echo "─── jaah-vm status: $arg ───"
-    # qm stores description URL-encoded (%3A, %0A, etc.); decode for display.
-    qm config "$vmid" \
-        | grep -E '^(name|tags|cores|memory|cpu|net0|description|ipconfig0):' \
+    local owner
+    owner=$(locate_vmid_node "$vmid") || fail "VMID $vmid has a manifest but no qemu-server config on any node"
+    local me; me=$(hostname -s)
+
+    echo "─── jaah-vm status: $arg ($owner) ───"
+    # Read VM config directly from pmxcfs (cluster-shared); qm config is
+    # local-node only and would error if we're not on the owner.
+    local cfg="/etc/pve/nodes/${owner}/qemu-server/${vmid}.conf"
+    [ -f "$cfg" ] || fail "Cannot read config file at $cfg"
+    grep -E '^(name|tags|cores|memory|cpu|net0|description|ipconfig0):' "$cfg" \
         | python3 -c "
 import sys, urllib.parse
 for line in sys.stdin:
@@ -948,12 +994,21 @@ for line in sys.stdin:
         print('  ' + line.rstrip())
 "
     local s
-    s=$(qm status "$vmid" | awk '{print $2}')
+    s=$(qm_on_node "$vmid" status "$vmid" 2>/dev/null | awk '{print $2}')
     echo "  status: $s"
     if [ "$s" = "running" ]; then
+        # qga ping needs to run on the owning node too.
         local ip
-        ip=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null \
-            | jq -r '.[]?.["ip-addresses"][]? | select(.["ip-address-type"]=="ipv4" and (.["ip-address"]|test("^192\\.168\\."))) | .["ip-address"]' 2>/dev/null | head -1)
+        if [ "$owner" = "$me" ]; then
+            ip=$(qm guest cmd "$vmid" network-get-interfaces 2>/dev/null \
+                | jq -r '.[]?.["ip-addresses"][]? | select(.["ip-address-type"]=="ipv4" and (.["ip-address"]|test("^192\\.168\\."))) | .["ip-address"]' 2>/dev/null | head -1)
+        else
+            local owner_ip
+            owner_ip=$(resolve_node_ip "$owner")
+            ip=$(ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${owner_ip}" \
+                "qm guest cmd $vmid network-get-interfaces" 2>/dev/null \
+                | jq -r '.[]?.["ip-addresses"][]? | select(.["ip-address-type"]=="ipv4" and (.["ip-address"]|test("^192\\.168\\."))) | .["ip-address"]' 2>/dev/null | head -1)
+        fi
         echo "  ip:     ${ip:-<not yet>}"
     fi
 }
@@ -974,8 +1029,8 @@ cmd_shell() {
     is_managed "$vmid" || fail "VMID $vmid is not managed by jaah-vm"
 
     local s
-    s=$(qm status "$vmid" | awk '{print $2}')
-    [ "$s" = "running" ] || fail "VM not running (status: $s) — start with: qm start $vmid"
+    s=$(qm_on_node "$vmid" status "$vmid" 2>/dev/null | awk '{print $2}')
+    [ "$s" = "running" ] || fail "VM not running (status: $s) — start with: jaah-vm start $arg"
 
     local ip
     ip=$(_wait_for_ip "$vmid" 30)
@@ -1014,7 +1069,8 @@ _destroy_managed() {
 
     if [ "$mode" != "force" ]; then
         echo "About to destroy: VMID=$vmid  name=$name  (managed by jaah-vm)"
-        read -r -p "Type the VM name to confirm: " typed
+        local typed=""
+        read -r -p "Type the VM name to confirm: " typed || typed=""
         [ "$typed" = "$name" ] || fail "Confirmation mismatch — aborted"
     fi
 
@@ -1023,7 +1079,18 @@ _destroy_managed() {
 
 _do_destroy() {
     local vmid="$1" name="$2"
-    log "Destroying VMID=$vmid ($name)"
+
+    # Locate the VM (qm config/stop/destroy are local-node-only; ssh-through
+    # to the owning node if the VM lives elsewhere).
+    local owner me
+    owner=$(locate_vmid_node "$vmid") \
+        || fail "VMID $vmid has a manifest but no qemu-server config on any node — refusing to delete manifest until you reconcile state"
+    me=$(hostname -s)
+    if [ "$owner" != "$me" ]; then
+        log "Destroying VMID=$vmid ($name) — VM lives on $owner, ssh-through"
+    else
+        log "Destroying VMID=$vmid ($name)"
+    fi
 
     # ── Archive recipe to /var/lib/jaah-vm/history/ BEFORE we delete it.
     # That way `jaah-vm rebuild <name>` can still find it post-destroy.
@@ -1032,19 +1099,21 @@ _do_destroy() {
         install -m 700 -d "${JAAH_STATE}/history"
         local ts
         ts=$(date -u +%Y%m%dT%H%M%SZ)
-        # Tag-safe filename: <ts>-<vmid>-<name>.cmd
         local archive="${JAAH_STATE}/history/${ts}-${vmid}-${name}.cmd"
         install -m 600 "$recipe_src" "$archive"
     fi
 
-    qm stop "$vmid" --skiplock --timeout 30 &>/dev/null || true
+    qm_on_node "$vmid" stop "$vmid" --skiplock --timeout 30 &>/dev/null || true
     sleep 1
-    qm destroy "$vmid" --purge 1 --destroy-unreferenced-disks 1 --skiplock
-    # Clean snippet files for this VMID
-    rm -f "${JAAH_SNIPPETS_PATH}/${vmid}-user.yaml" 2>/dev/null || true
+    qm_on_node "$vmid" destroy "$vmid" --purge 1 --destroy-unreferenced-disks 1 --skiplock \
+        || fail "qm destroy failed on $owner — VM still exists; manifest left intact"
+
+    # Cleanup local artifacts (snippets, recipes, manifest) — manifest is
+    # in pmxcfs so removal is cluster-wide.
+    rm -f "${JAAH_SNIPPETS_PATH}/${JAAH_SNIPPET_PREFIX}${vmid}-user.yaml" 2>/dev/null || true
     rm -f "${JAAH_RECIPES}/${vmid}.cmd" 2>/dev/null || true
     remove_manifest "$vmid"
-    refresh_name_cache   # keep TAB-completion in sync
+    refresh_name_cache
     ok "Destroyed $vmid ($name)"
 }
 
@@ -1088,8 +1157,13 @@ cmd_rebuild() {
     echo "Recorded recipe for $arg:"
     echo "  Source: $source"
     echo "  $cmd_line"
-    read -r -p "Rebuild this VM? Type 'yes' to confirm: " typed
-    [ "$typed" = "yes" ] || fail "Aborted"
+
+    # `read` under set -e + closed/empty stdin (piped) returns non-zero and
+    # would silently kill the script without printing "Aborted". Capture
+    # explicitly so we always reach the comparison.
+    local typed=""
+    read -r -p "Rebuild this VM? Type 'yes' to confirm: " typed || typed=""
+    [ "$typed" = "yes" ] || fail "Aborted (got '${typed}', expected 'yes')"
 
     # Re-exec ourselves with the recorded args (after stripping the leading 'jaah-vm create')
     local self
@@ -1116,10 +1190,10 @@ cmd_start() {
     [ -n "$arg" ] || fail "Usage: jaah-vm start <name|vmid>"
     require_root
     local vmid; vmid=$(_resolve_managed_vmid "$arg")
-    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    local s; s=$(qm_on_node "$vmid" status "$vmid" 2>/dev/null | awk '{print $2}')
     [ "$s" = "running" ] && { ok "Already running"; return 0; }
     log "Starting VMID=$vmid"
-    qm start "$vmid"
+    qm_on_node "$vmid" start "$vmid"
     ok "Started"
 }
 
@@ -1131,14 +1205,14 @@ cmd_stop() {
     [ "${2:-}" = "--force" ] && mode="force"
     require_root
     local vmid; vmid=$(_resolve_managed_vmid "$arg")
-    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    local s; s=$(qm_on_node "$vmid" status "$vmid" 2>/dev/null | awk '{print $2}')
     [ "$s" = "stopped" ] && { ok "Already stopped"; return 0; }
     if [ "$mode" = "force" ]; then
         log "Force-stopping VMID=$vmid"
-        qm stop "$vmid" --timeout 10
+        qm_on_node "$vmid" stop "$vmid" --timeout 10
     else
         log "Shutting down VMID=$vmid (graceful, 60s timeout)"
-        qm shutdown "$vmid" --timeout 60 --forceStop 0 || \
+        qm_on_node "$vmid" shutdown "$vmid" --timeout 60 --forceStop 0 || \
             fail "Graceful shutdown failed — try: jaah-vm stop $arg --force"
     fi
     ok "Stopped"
@@ -1149,30 +1223,29 @@ cmd_restart() {
     [ -n "$arg" ] || fail "Usage: jaah-vm restart <name|vmid>"
     require_root
     local vmid; vmid=$(_resolve_managed_vmid "$arg")
-    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    local s; s=$(qm_on_node "$vmid" status "$vmid" 2>/dev/null | awk '{print $2}')
     if [ "$s" != "running" ]; then
         log "VMID=$vmid was stopped — starting"
-        qm start "$vmid"
+        qm_on_node "$vmid" start "$vmid"
         ok "Started"
         return 0
     fi
     log "Rebooting VMID=$vmid (graceful ACPI/qga, 60s timeout)"
     local rc=0
-    qm reboot "$vmid" --timeout 60 2>&1 || rc=$?
+    qm_on_node "$vmid" reboot "$vmid" --timeout 60 2>&1 || rc=$?
     if [ "$rc" -ne 0 ]; then
         warn "Graceful reboot timed out (qga not ready yet?) — falling back to hard reset"
-        qm reset "$vmid" --skiplock || fail "Hard reset also failed (qm reset exit $?)"
+        qm_on_node "$vmid" reset "$vmid" --skiplock || fail "Hard reset also failed (qm reset exit $?)"
     fi
-    # Post-check: PVE's qm reboot doesn't always re-start the VM after shutdown
-    # (depends on Ubuntu's ACPI handling). Wait briefly; start manually if still stopped.
+    # Post-check: PVE's qm reboot doesn't always re-start the VM after shutdown.
     local deadline=$(( $(date +%s) + 20 ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        s=$(qm status "$vmid" | awk '{print $2}')
+        s=$(qm_on_node "$vmid" status "$vmid" 2>/dev/null | awk '{print $2}')
         [ "$s" = "running" ] && { ok "Restarted"; return 0; }
         sleep 2
     done
     warn "VM ended up stopped after reboot — starting it now"
-    qm start "$vmid"
+    qm_on_node "$vmid" start "$vmid"
     ok "Restarted"
 }
 
@@ -1205,7 +1278,7 @@ cmd_snapshot() {
     [ -n "$desc" ] && args+=( --description "$desc" )
     [ "$with_vmstate" = "1" ] && args+=( --vmstate 1 )
 
-    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    local s; s=$(qm_on_node "$vmid" status "$vmid" 2>/dev/null | awk '{print $2}')
     if [ "$with_vmstate" = "1" ] && [ "$s" != "running" ]; then
         warn "VM stopped — taking snapshot without --vmstate (disk-only)"
         args=( "$vmid" "$snap_name" )
@@ -1213,7 +1286,7 @@ cmd_snapshot() {
     fi
 
     log "Creating snapshot '$snap_name' on VMID=$vmid"
-    qm snapshot "${args[@]}"
+    qm_on_node "$vmid" snapshot "${args[@]}"
     ok "Snapshot '$snap_name' created"
     log "  List:   qm listsnapshot $vmid"
     log "  Roll:   qm rollback $vmid $snap_name"
@@ -1370,24 +1443,44 @@ cmd_exec() {
 
     [ -n "$arg" ] || fail "Usage: jaah-vm exec <name|vmid> [--timeout N] [--] <cmd> [args...]"
     [ $# -gt 0 ] || fail "No command specified after VM name"
-    [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || fail "--timeout must be a positive integer"
+    # Must be a positive integer (>= 1). Reject 0, negatives, non-numeric.
+    [[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]] || fail "--timeout must be a positive integer (got: '$TIMEOUT')"
 
     require_root
     local vmid; vmid=$(_resolve_managed_vmid "$arg")
 
-    local s; s=$(qm status "$vmid" | awk '{print $2}')
+    # qm guest commands are local-node only. If the VM lives elsewhere, the
+    # remote ssh-through pattern from qm_on_node handles it transparently.
+    local owner; owner=$(locate_vmid_node "$vmid") \
+        || fail "VMID $vmid has a manifest but no qemu-server config on any node"
+    local me; me=$(hostname -s)
+
+    local s; s=$(qm_on_node "$vmid" status "$vmid" 2>/dev/null | awk '{print $2}')
     [ "$s" = "running" ] || fail "VM not running (status: $s) — start with: jaah-vm start $arg"
 
     # Probe qga responsiveness quickly so failures are loud
-    if ! qm guest cmd "$vmid" ping &>/dev/null; then
-        fail "qemu-guest-agent not responding inside VM $arg — try 'jaah-vm shell' instead"
+    if [ "$owner" = "$me" ]; then
+        qm guest cmd "$vmid" ping &>/dev/null \
+            || fail "qemu-guest-agent not responding inside VM $arg — try 'jaah-vm shell' instead"
+    else
+        local owner_ip; owner_ip=$(resolve_node_ip "$owner")
+        ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${owner_ip}" \
+            "qm guest cmd $vmid ping" &>/dev/null \
+            || fail "qemu-guest-agent not responding inside VM $arg (on $owner) — try 'jaah-vm shell' instead"
     fi
 
     # Capture full output from qm guest exec. On timeout qm prints a non-JSON
     # prefix ("timeout reached, returning pid") followed by `{"pid": N}`, then
     # still exits 0. Detect that case explicitly before piping to jq.
     local raw rc
-    raw=$(qm guest exec "$vmid" --timeout "$TIMEOUT" -- "$@" 2>&1) || rc=$?
+    if [ "$owner" = "$me" ]; then
+        raw=$(qm guest exec "$vmid" --timeout "$TIMEOUT" -- "$@" 2>&1) || rc=$?
+    else
+        local owner_ip2; owner_ip2=$(resolve_node_ip "$owner")
+        # shellcheck disable=SC2029
+        raw=$(ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${owner_ip2}" \
+            "qm guest exec $vmid --timeout $TIMEOUT -- $(printf '%q ' "$@")" 2>&1) || rc=$?
+    fi
     rc="${rc:-0}"
 
     if [ "$rc" -ne 0 ]; then
@@ -1721,21 +1814,24 @@ EOF
 _show_subcmd_help() {
     case "$1" in
         wizard)   echo "Usage: jaah-vm wizard       Interactive 7-step VM-creation TUI (requires a TTY).";;
-        list)     echo "Usage: jaah-vm list         List all VMs managed by jaah-vm (manifest-tracked).";;
-        status)   echo "Usage: jaah-vm status <name|vmid>     Show VM details (cores, ram, ip, tags, recipe).";;
-        shell)    echo "Usage: jaah-vm shell  <name|vmid>     SSH into the VM as the operator user (key auth).";;
+        create)   echo "Usage: jaah-vm create --name <hostname> [--type tiny|small|...] [--start] [--wait-ssh] [more — see jaah-vm create with full --help via 'man'].";;
+        list)     echo "Usage: jaah-vm list [--json]   List all VMs managed by jaah-vm (manifest-tracked).";;
+        status)   echo "Usage: jaah-vm status <name|vmid>     Show VM details (cores, ram, ip, tags, recipe). Works across cluster nodes.";;
+        shell)    echo "Usage: jaah-vm shell  <name|vmid> [--user <name>]    SSH into the VM as the operator user (key auth).";;
         exec)     echo "Usage: jaah-vm exec   <name|vmid> [--timeout N] [--] <cmd> [args...]   Run a command via qemu-guest-agent (no SSH).";;
-        start)    echo "Usage: jaah-vm start  <name|vmid>     Boot a stopped VM.";;
-        stop)     echo "Usage: jaah-vm stop   <name|vmid> [--force]   Graceful ACPI shutdown (--force = hard stop).";;
+        start)    echo "Usage: jaah-vm start  <name|vmid>     Boot a stopped VM (cross-node aware).";;
+        stop)     echo "Usage: jaah-vm stop   <name|vmid> [--force]   Graceful ACPI shutdown (--force = hard stop). Cross-node aware.";;
         restart|reboot)
                   echo "Usage: jaah-vm restart <name|vmid>    Graceful reboot, falls back to hard reset if qga unresponsive.";;
         snapshot|snap)
-                  echo "Usage: jaah-vm snapshot <name|vmid> [--name N] [--description \"...\"]";;
+                  echo "Usage: jaah-vm snapshot <name|vmid> [--name N] [--description \"...\"] [--no-vmstate]";;
         migrate)  echo "Usage: jaah-vm migrate <name|vmid> <target-node> [--offline] [--targetstorage <name>]";;
         rebuild|rerun)
                   echo "Usage: jaah-vm rebuild <name|vmid>    Replay the exact recipe that built this VM (works after destroy via /var/lib/jaah-vm/history/).";;
         destroy|terminate)
-                  echo "Usage: jaah-vm destroy <name|vmid>    Permanently remove the VM (typed-confirm required; recipe archived to history).";;
+                  echo "Usage: jaah-vm destroy <name|vmid> [--force]    Permanently remove the VM (typed-confirm unless --force; recipe archived to history). Cross-node aware.";;
+        doctor)   echo "Usage: jaah-vm doctor [--rebuild-template]    Cluster + storage + template health check.";;
+        types)    echo "Usage: jaah-vm types          Print the table of instance-type presets (tiny → 2xl + custom).";;
         *) return 1;;
     esac
     return 0

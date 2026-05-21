@@ -13,7 +13,7 @@ _jaah_vm() {
         cword=$COMP_CWORD
     fi
 
-    local subcommands="wizard create list status shell exec start stop restart snapshot migrate rebuild destroy terminate doctor types"
+    local subcommands="wizard create list status shell exec start stop restart reboot snapshot snap migrate rebuild rerun destroy terminate doctor types"
     local types="tiny small medium large xl 2xl"
     local envs="dev staging prod"
 

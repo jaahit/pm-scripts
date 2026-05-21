@@ -34,7 +34,8 @@ JAAH_ORPHANS="${JAAH_ORPHANS:-${JAAH_STATE}/orphans}"
 JAAH_RUN="${JAAH_RUN:-/run/jaah-vm}"
 JAAH_LOCK="${JAAH_LOCK:-/etc/pve/jaah-vm.lock.d}"
 JAAH_MANIFEST_DIR="${JAAH_MANIFEST_DIR:-/etc/pve/jaah-vm}"
-JAAH_SNIPPETS_PATH="${JAAH_SNIPPETS_PATH:-/mnt/pve/iso-library/snippets/jaah-vm}"
+JAAH_SNIPPETS_PATH="${JAAH_SNIPPETS_PATH:-/mnt/pve/iso-library/snippets}"
+JAAH_SNIPPET_PREFIX="${JAAH_SNIPPET_PREFIX:-jaah-vm-}"
 JAAH_NAMES_CACHE="${JAAH_NAMES_CACHE:-${JAAH_STATE}/names.cache}"
 
 # Cluster constants — keep aligned with infrastructure
@@ -241,15 +242,24 @@ read_secret() {
 # Protection comes from: manifest existence + typed-name confirmation.
 
 # write_manifest <vmid> <name> — atomically create pmxcfs-replicated manifest.
+# Includes node (host that created the VM) and created_by (user@host) for
+# post-hoc audit and cross-node listing.
 write_manifest() {
     local vmid="$1" name="$2"
-    local created
+    local created node created_by
     created=$(date -u +%FT%TZ)
+    node=$(hostname -s)
+    created_by="$(whoami)@${node}"
     mkdir -p "$JAAH_MANIFEST_DIR"
     local tmp="${JAAH_MANIFEST_DIR}/.${vmid}.json.tmp"
-    cat > "$tmp" <<EOF
-{"vmid":${vmid},"name":"${name}","created":"${created}","version":"${JAAH_VM_VERSION:-unknown}"}
-EOF
+    # jq builds quote-safe JSON (no shell-injection through $name).
+    jq -n \
+        --arg vmid "$vmid" --arg name "$name" --arg created "$created" \
+        --arg node "$node" --arg created_by "$created_by" \
+        --arg version "${JAAH_VM_VERSION:-unknown}" \
+        '{vmid:($vmid|tonumber), name:$name, node:$node,
+          created:$created, created_by:$created_by, version:$version}' \
+        > "$tmp"
     mv -f "$tmp" "${JAAH_MANIFEST_DIR}/${vmid}.json"
 }
 
@@ -456,6 +466,59 @@ ensure_state_dirs() {
     install -m 755 -d "$JAAH_MANIFEST_DIR" 2>/dev/null || true
     touch "$JAAH_LOG" 2>/dev/null || true
     chmod 640 "$JAAH_LOG" 2>/dev/null || true
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Cross-node VMID location helpers (pmxcfs is the cluster's authority)
+# ────────────────────────────────────────────────────────────────────────────
+
+# locate_vmid_node <vmid> — print the cluster member that owns the VM's
+# qemu-server config in pmxcfs. Empty (rc=1) if not found anywhere.
+# `qm config` and friends are local-node-only; this helper lets callers
+# decide whether to ssh-through to the source.
+locate_vmid_node() {
+    local vmid="$1"
+    [ -n "$vmid" ] || return 1
+    local f
+    for f in /etc/pve/nodes/*/qemu-server/"${vmid}".conf; do
+        [ -e "$f" ] || continue
+        # Path is /etc/pve/nodes/<node>/qemu-server/<vmid>.conf
+        local node
+        node="${f#/etc/pve/nodes/}"
+        node="${node%%/*}"
+        printf '%s' "$node"
+        return 0
+    done
+    return 1
+}
+
+# resolve_node_ip <node> — print IP for a cluster member from /etc/pve/.members
+# (cluster's authoritative registry; works even if /etc/hosts has no entry).
+resolve_node_ip() {
+    local node="$1"
+    [ -n "$node" ] || return 1
+    jq -r ".nodelist[\"${node}\"].ip // empty" /etc/pve/.members 2>/dev/null
+}
+
+# qm_on_node <vmid> <qm-subcommand-args...> — run a qm command on whichever
+# node owns the VM. If the VM lives locally, runs directly; otherwise
+# ssh-throughs to the owning node using its pmxcfs IP. Exits with the
+# remote qm's status.
+qm_on_node() {
+    local vmid="$1"; shift
+    local owner
+    owner=$(locate_vmid_node "$vmid") || { printf 'qm_on_node: VMID %s not found in any node\n' "$vmid" >&2; return 1; }
+    local me; me=$(hostname -s)
+    if [ "$owner" = "$me" ]; then
+        qm "$@"
+    else
+        local ip
+        ip=$(resolve_node_ip "$owner")
+        [ -n "$ip" ] || { printf 'qm_on_node: cannot resolve IP for %s\n' "$owner" >&2; return 1; }
+        # shellcheck disable=SC2029
+        ssh -o StrictHostKeyChecking=no -o BatchMode=yes "root@${ip}" \
+            "qm $(printf '%q ' "$@")"
+    fi
 }
 
 # ────────────────────────────────────────────────────────────────────────────
